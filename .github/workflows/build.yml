@@ -1,305 +1,147 @@
-name: Build Roblox 2016 Client (v2)
+name: Build Roblox 2016 (WindowsClient)
 
-# Trigger manually: Actions tab -> Build Roblox 2016 Client (v2) -> Run workflow
 on:
   workflow_dispatch:
+    inputs:
+      build_qt:
+        description: 'Also build Qt 4.8.5 (NOT needed for the client, only for Studio - adds ~1-2h)'
+        type: boolean
+        default: false
 
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-latest
     timeout-minutes: 350
 
-    env:
-      SRC: C:\Roblox\Source
-      RUNTIMEDLLS: C:\Roblox\RuntimeDLLs
-
     steps:
-      # -------------------------------------------------------------
-      # 1. Add the MSVC v140 (VS2015) toolset + Windows 8.1 SDK to VS2022.
-      #    The repo targets v140_xp; we build with plain v140.
-      # -------------------------------------------------------------
-      - name: Install v140 toolset and Windows 8.1 SDK
-        shell: pwsh
-        run: |
-          $setup   = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -property installationPath
-          if (-not $vs) { throw "VS2022 not found on runner" }
-          $argStr = 'modify --installPath "' + $vs + '" --add Microsoft.VisualStudio.Component.VC.140 --add Microsoft.VisualStudio.Component.Windows81SDK --quiet --norestart --nocache'
-          $p = Start-Process -Wait -PassThru -FilePath $setup -ArgumentList $argStr
-          Write-Host "Installer exit code: $($p.ExitCode)"
-          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "v140 component install failed (exit $($p.ExitCode))" }
-          $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.140 -property installationPath
-          if (-not $found) { throw "v140 toolset still missing after install" }
-          Write-Host "v140 toolset ready at: $found"
+      - name: Enable long paths (repo has very deep paths)
+        run: git config --global core.longpaths true
 
-      # -------------------------------------------------------------
-      # 2. Clone the source (to the path build_boost.bat expects)
-      # -------------------------------------------------------------
-      - name: Clone source
-        shell: cmd
-        run: git clone --depth 1 --config core.longpaths=true https://github.com/${{ github.repository }}.git C:\Roblox\Source
-
-      # -------------------------------------------------------------
-      # 3. Fill missing Boost 1.74 files from the official source.
-      #    The repo's vendored Boost is incomplete (thread sources,
-      #    some headers). Only files ABSENT from the repo are copied,
-      #    so Roblox's own patches are never overwritten.
-      # -------------------------------------------------------------
-      - name: Fill missing Boost 1.74 files from official source
-        shell: pwsh
-        run: |
-          $url  = 'https://archives.boost.io/release/1.74.0/source/boost_1_74_0.tar.gz'
-          $tgz  = 'C:\boost_1_74_0.tar.gz'
-          Invoke-WebRequest $url -OutFile $tgz
-          New-Item -ItemType Directory -Force C:\boost74 | Out-Null
-          tar -xzf $tgz -C C:\boost74
-          if (-not (Test-Path C:\boost74\boost_1_74_0\Jamroot)) { throw "Boost tarball extraction failed" }
-          # /XC /XN /XO => copy only files that do not exist in the destination
-          robocopy C:\boost74\boost_1_74_0 "$env:SRC\Library\boost" /E /XC /XN /XO /XD doc more test example /NFL /NDL /NJH /NJS | Out-Null
-          if ($LASTEXITCODE -ge 8) { throw "robocopy failed with code $LASTEXITCODE" }
-          # The projects include from Library\boost\include (Roblox's own header
-          # copy, not part of the official tree). Fill its missing headers from
-          # the tarball's boost\ (e.g. thread\win32\thread_data.hpp).
-          robocopy C:\boost74\boost_1_74_0\boost "$env:SRC\Library\boost\include\boost" /E /XC /XN /XO /NFL /NDL /NJH /NJS | Out-Null
-          if ($LASTEXITCODE -ge 8) { throw "robocopy include fill failed with code $LASTEXITCODE" }
-          $checks = @(
-            'Library\boost\libs\thread\src\win32\thread.cpp',
-            'Library\boost\libs\thread\src\win32\tss_dll.cpp',
-            'Library\boost\libs\thread\src\win32\tss_pe.cpp',
-            'Library\boost\include\boost\predef\architecture\x86\32.h',
-            'Library\boost\include\boost\preprocessor\debug\error.hpp',
-            'Library\boost\include\boost\thread\win32\thread_data.hpp'
-          )
-          foreach ($c in $checks) {
-            if (-not (Test-Path (Join-Path $env:SRC $c))) { throw "Boost fill failed: still missing $c" }
-          }
-          Write-Host "Boost fill verified OK"
-
-      # -------------------------------------------------------------
-      # 4. Fetch external binaries missing from the repo:
-      #    FMOD 1.07.02 lib + dll, TBB 4.1 (headers + ia32 lib + dlls),
-      #    SDL2 runtime dll.
-      #    (d3dx9/DxErr9 libs & headers are already vendored in Library\SDK)
-      # -------------------------------------------------------------
-      - name: Fetch missing externals (FMOD, TBB, SDL2 dll)
-        shell: pwsh
-        run: |
-          # ---- FMOD 1.07.02 (headers fmod/include exist in repo, lib missing)
-          New-Item -ItemType Directory -Force "$env:SRC\fmod\win32\lib", $env:RUNTIMEDLLS | Out-Null
-          Invoke-WebRequest 'https://raw.githubusercontent.com/terrehbyte/FMODwrapper/master/lib/fmod/libs/fmod_vc.lib' -OutFile "$env:SRC\fmod\win32\lib\fmod_vc.lib"
-          Invoke-WebRequest 'https://raw.githubusercontent.com/terrehbyte/FMODwrapper/master/Debug/fmod.dll' -OutFile "$env:RUNTIMEDLLS\fmod.dll"
-
-          # ---- TBB 4.1 (whole TBB_4_1 dir is missing from the repo)
-          Invoke-WebRequest 'https://downloads.sourceforge.net/project/tbb/threading_building_blocks/4.1%20Update%204/tbb41_20130401oss_win.zip' -OutFile C:\tbb.zip
-          Expand-Archive C:\tbb.zip C:\tbb -Force
-          $tbbRoot = Get-ChildItem C:\tbb -Directory | Select-Object -First 1
-          New-Item -ItemType Directory -Force "$env:SRC\TBB_4_1\include", "$env:SRC\TBB_4_1\lib" | Out-Null
-          Copy-Item "$($tbbRoot.FullName)\include\*" "$env:SRC\TBB_4_1\include\" -Recurse -Force
-          Copy-Item "$($tbbRoot.FullName)\lib\ia32\tbb.lib" "$env:SRC\TBB_4_1\lib\tbb.lib"
-          foreach ($d in 'tbb.dll','tbbmalloc.dll') {
-            if (Test-Path "$($tbbRoot.FullName)\lib\ia32\$d") { Copy-Item "$($tbbRoot.FullName)\lib\ia32\$d" $env:RUNTIMEDLLS }
-          }
-
-          # ---- SDL2 runtime dll (SDL2.lib import lib is already in the repo)
-          Invoke-WebRequest 'https://www.libsdl.org/release/SDL2-devel-2.0.12-VC.zip' -OutFile C:\sdl2vc.zip
-          Expand-Archive C:\sdl2vc.zip C:\sdl2vc -Force
-          Copy-Item C:\sdl2vc\SDL2-2.0.12\lib\x86\SDL2.dll $env:RUNTIMEDLLS
-
-          # ---- DirectX End-User Runtimes (for d3dx9_43.dll at runtime)
-          Invoke-WebRequest 'https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe' -OutFile C:\dxredist.exe
-
-          Write-Host "--- TBB_4_1:"; Get-ChildItem "$env:SRC\TBB_4_1" -Depth 1 | Select-Object -First 8 | ForEach-Object { $_.FullName }
-          Write-Host "--- RuntimeDLLs:"; Get-ChildItem $env:RUNTIMEDLLS | ForEach-Object { $_.Name }
-
-      # -------------------------------------------------------------
-      # 5. Patch build_boost.bat:
-      #    D:\ -> C:\, remove PAUSE, parallel jobs, skip python/mpi,
-      #    keep Roblox's patched headers untouched (--includedir to a
-      #    throwaway dir), and put libs where the projects link them
-      #    (Library\boost\stage\lib, matching AdditionalLibraryDirectories).
-      # -------------------------------------------------------------
-      - name: Patch build_boost.bat
-        shell: pwsh
-        run: |
-          $f = "$env:SRC\Library\boost\build_boost.bat"
-          $c = [System.IO.File]::ReadAllText($f)
-          $c = $c.Replace('D:\Roblox\Source', 'C:\Roblox\Source')
-          $c = $c.Replace('PAUSE', '')
-          # -a forces a full rebuild every time; drop it so a cached stage can be reused incrementally
-          $c = $c.Replace('-a ^', '')
-          # Only the libs the client actually auto-links (verified by grep):
-          # chrono, date_time, filesystem, iostreams, program_options, system, thread
-          $c = $c.Replace('--toolset=msvc-14.0 ^', "--toolset=msvc-14.0 ^`r`n-j4 ^`r`n--with-chrono ^`r`n--with-date_time ^`r`n--with-filesystem ^`r`n--with-iostreams ^`r`n--with-program_options ^`r`n--with-system ^`r`n--with-thread ^")
-          $c = $c.Replace('--includedir=C:\Roblox\Source\Library\boost\include', '--includedir=C:\boost-headers-out')
-          $c = $c.Replace('--libdir=C:\Roblox\Source\Library\boost\lib', '--stagedir=C:\Roblox\Source\Library\boost\stage')
-          [System.IO.File]::WriteAllText($f, $c, (New-Object System.Text.ASCIIEncoding))
-          Write-Host "--- patched build_boost.bat:"; Get-Content $f
-
-      # -------------------------------------------------------------
-      # 6. Create a VS2015-path shim so b2 (Boost.Build 1.74, which
-      #    predates VS2022) can find a vcvarsall for toolset 14.0:
-      #    VS140COMNTOOLS env var + registry ProductDir keys.
-      # -------------------------------------------------------------
-      - name: Create VS2015 detection shim for b2
-        shell: pwsh
-        run: |
-          $shimRoot = 'C:\VS2015Shim'
-          New-Item -ItemType Directory -Force "$shimRoot\Common7\Tools", "$shimRoot\VC" | Out-Null
-          $vsBase = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat'
-          $shimLines = @('@echo off', "call `"$vsBase`" %* -vcvars_ver=14.0")
-          [System.IO.File]::WriteAllLines("$shimRoot\VC\vcvarsall.bat", $shimLines)
-          "VS140COMNTOOLS=$shimRoot\Common7\Tools\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          foreach ($view in 'SOFTWARE\Microsoft\VisualStudio\14.0\Setup\VC', 'SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\Setup\VC') {
-            reg add "HKLM\$view" /v ProductDir /t REG_SZ /d "$shimRoot\VC\" /f | Out-Null
-          }
-          Write-Host "Shim + registry keys written"
-
-      # -------------------------------------------------------------
-      # 6b. Cache the built Boost stage so re-runs skip the b2 build
-      # -------------------------------------------------------------
-      - name: Cache Boost build
-        uses: actions/cache@v4
+      - name: Checkout source (shallow)
+        uses: actions/checkout@v4
         with:
-          path: |
-            C:\Roblox\Source\Library\boost\stage
-            C:\Roblox\Source\Library\boost\b2.exe
-            C:\Roblox\Source\Library\boost\project-config.jam
-          key: boost-1.74-v140-x86-v1
+          fetch-depth: 1
 
-      # -------------------------------------------------------------
-      # 7. Build Boost 1.74 (x86, release, v140). ~10-20 minutes for
-      #    the 7 libs the client links.
-      #    Dumps bootstrap.log if the engine build fails.
-      # -------------------------------------------------------------
-      - name: Build Boost
+      - name: Disable Defender real-time scanning (big build speedup)
+        shell: powershell
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+
+      - name: Copy source tree to C:\Roblox\Source
+        shell: pwsh
+        run: |
+          robocopy "$env:GITHUB_WORKSPACE" 'C:\Roblox\Source' /E /NFL /NDL /NJH /NJS /MT:16 /XD .git
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path 'C:\Roblox\Source\Library\boost\bootstrap.bat')) { throw 'Source tree incomplete at C:\Roblox\Source' }
+          Write-Host 'Source tree ready at C:\Roblox\Source'
+
+      - name: Patch project files for cloud build
+        shell: pwsh
+        run: |
+          # 1) Hardcoded D:\Roblox\Source paths -> C:\Roblox\Source
+          # 2) v140_xp (Windows XP toolset) does not exist on cloud runners -> plain v140
+          # 3) Projects declare no WindowsTargetPlatformVersion -> inject 10.0 (= newest SDK on runner)
+          # 4) Pre-build step calls a converter tool never committed to the repo; its generated
+          #    output (App/script/CoreScript.cpp) IS committed, so make the step a no-op.
+          $files = Get-ChildItem 'C:\Roblox\Source' -Recurse -File |
+                   Where-Object { $_.FullName -notmatch '\\\.git\\' -and
+                                  $_.Extension -in '.vcxproj', '.props', '.targets', '.bat', '.cmd' }
+          $patched = 0
+          foreach ($f in $files) {
+            $t = Get-Content -Raw $f.FullName
+            $n = $t.Replace('D:\Roblox\Source', 'C:\Roblox\Source')
+            if ($n -match 'v140_xp') { $n = $n.Replace('v140_xp', 'v140') }
+            if ($f.Extension -eq '.vcxproj' -and $n -notmatch 'WindowsTargetPlatformVersion') {
+              $n = [regex]::Replace($n, '<PlatformToolset>[^<]+</PlatformToolset>',
+                    '<PlatformToolset>v140</PlatformToolset><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>')
+            }
+            if ($n.Contains('CoreScriptConverter2\tool\win32\BuildCoreScripts.bat')) {
+              $n = $n.Replace('..\CoreScriptConverter2\tool\win32\BuildCoreScripts.bat ..\rsc.config',
+                              'echo Skipping BuildCoreScripts - generated scripts are already committed.')
+            }
+            if ($n -ne $t) {
+              Set-Content -Path $f.FullName -Value $n -NoNewline
+              $patched++
+            }
+          }
+          Write-Host "Patched $patched files."
+
+      - name: Check FMOD import library (known repo gap)
+        shell: pwsh
+        run: |
+          if (Test-Path 'C:\Roblox\Source\fmod\win32\lib\fmod_vc.lib') {
+            Write-Host 'fmod_vc.lib found - link step will work.'
+          } else {
+            Write-Host '::warning::fmod\win32\lib\fmod_vc.lib is MISSING from the upstream repo (FMOD 1.07.02 Windows binaries were never committed).'
+            Write-Host '::warning::Expect the final link step to fail with: LNK1104 cannot open file fmod_vc.lib'
+            Write-Host '::warning::Fix without installing anything: free account at fmod.com -> Download -> FMOD Engine -> version 1.07.x -> Windows. From the downloaded API folder upload fmod_vc.lib into your fork at fmod/win32/lib/ and fmod.dll into fmod/win32/bin/ (GitHub web UI, drag and drop), then re-run this workflow.'
+          }
+
+      - name: Build Boost 1.74 (bootstrap + b2)
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 -vcvars_ver=14.0
-          echo === cl version ===
-          cl 2>&1 | findstr /C:"Version"
           cd /d C:\Roblox\Source\Library\boost
-          call bootstrap.bat msvc
-          if errorlevel 1 (
-            echo === bootstrap FAILED - bootstrap.log: ===
-            type bootstrap.log
-            exit /b 1
-          )
-          echo === b2 engine built OK, starting library build ===
-          call build_boost.bat > C:\boost_build.log 2>&1
-          if errorlevel 1 (
-            echo === b2 FAILED - last 80 lines of C:\boost_build.log: ===
-            powershell -Command "Get-Content C:\boost_build.log -Tail 80"
-            exit /b 1
-          )
-          if not exist "C:\Roblox\Source\Library\boost\stage\lib\libboost_*.lib" (
-            echo === no libboost_*.lib in stage\lib ===
-            dir C:\Roblox\Source\Library\boost\stage /s /b
-            exit /b 1
-          )
-          echo === Boost built. stage\lib contents: ===
-          dir C:\Roblox\Source\Library\boost\stage\lib | findstr libboost
-
-      # -------------------------------------------------------------
-      # 7b. Inject MultiProcessorCompilation (/MP) for every project —
-      #     parallelizes cl across cores, ~2x faster client build.
-      #     Directory.Build.props is auto-imported by all vcxproj.
-      # -------------------------------------------------------------
-      - name: Inject /MP parallel compilation
-        shell: pwsh
-        run: |
-          $propsLines = @(
-            '<Project>',
-            '  <ItemDefinitionGroup>',
-            '    <ClCompile>',
-            '      <MultiProcessorCompilation>true</MultiProcessorCompilation>',
-            '      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>',
-            '    </ClCompile>',
-            '  </ItemDefinitionGroup>',
-            '</Project>'
-          )
-          [System.IO.File]::WriteAllLines("$env:SRC\Directory.Build.props", $propsLines, [System.Text.UTF8Encoding]::new($true))
-          Write-Host "Directory.Build.props written:"; Get-Content "$env:SRC\Directory.Build.props"
-
-      # -------------------------------------------------------------
-      # 8. Patch WindowsClient project (SDL2 lib path fix:
-      #    $(CONTRIB_PATH) is undefined in the open-source tree)
-      # -------------------------------------------------------------
-      - name: Patch WindowsClient.vcxproj
-        shell: pwsh
-        run: |
-          $f = "$env:SRC\WindowsClient\WindowsClient.vcxproj"
-          $c = [System.IO.File]::ReadAllText($f)
-          $c = $c.Replace('$(CONTRIB_PATH)\SDL2\VisualC\Win32\Release\SDL2.lib', 'SDL2.lib')
-          [System.IO.File]::WriteAllText($f, $c, [System.Text.UTF8Encoding]::new($true))
-          Write-Host "SDL2 lib path patched"
-
-      # -------------------------------------------------------------
-      # 9. Build strmbase.lib from the repo's OWN DirectShow BaseClasses
-      #    source (Library\DSBaseClasses\Sources), with /MD to match the
-      #    application's runtime (MultiThreadedDLL in Release|Win32).
-      # -------------------------------------------------------------
-      - name: Build strmbase.lib (DirectShow BaseClasses)
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 -vcvars_ver=14.0
-          mkdir C:\strmbase-obj
-          cd /d C:\Roblox\Source\Library\DSBaseClasses\Sources
-          for %%f in (*.cpp) do if /i not "%%f"=="dllentry.cpp" if /i not "%%f"=="dllsetup.cpp" cl /nologo /c /O2 /MD /DNDEBUG /DWIN32 /D_WINDOWS /D_MBCS /EHsc /I. /FoC:\strmbase-obj\ %%f
+          call bootstrap.bat
           if errorlevel 1 exit /b 1
-          lib /NOLOGO /OUT:C:\Roblox\Source\Library\DSBaseClasses\Lib\strmbase.lib C:\strmbase-obj\*.obj
-          dir C:\Roblox\Source\Library\DSBaseClasses\Lib\strmbase.lib
+          b2 stage -a --reconfigure --toolset=msvc-14.0 --variant=release -j%NUMBER_OF_PROCESSORS% ^
+            -s ZLIB_SOURCE=C:\Roblox\Source\Library\zlib\include\zlib ^
+            -s ZLIB_BINARY=C:\Roblox\Source\Library\zlib\lib\release ^
+            --prefix=C:\Roblox\Source\Library\boost ^
+            --libdir=C:\Roblox\Source\Library\boost\lib ^
+            --includedir=C:\Roblox\Source\Library\boost\include > C:\Roblox\Source\boost_b2.log 2>&1
+          if errorlevel 1 (
+            powershell -NoProfile -Command "Get-Content C:\Roblox\Source\boost_b2.log -Tail 80"
+            exit /b 1
+          )
+          if not exist stage\lib\libboost_*-vc140*.lib (
+            echo Boost stage output missing!
+            exit /b 1
+          )
+          echo Boost OK
 
-      # -------------------------------------------------------------
-      # 10. VMProtectSDK32.dll no-op stub (the real SDK dll is a
-      #     pass-through when the exe is not protected; link uses the
-      #     VMProtectSDK32.lib already vendored in the repo).
-      # -------------------------------------------------------------
-      - name: Build VMProtectSDK32.dll stub
+      - name: Build Qt 4.8.5 (optional)
+        if: ${{ inputs.build_qt == true }}
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 -vcvars_ver=14.0
-          (echo LIBRARY VMProtectSDK32& echo EXPORTS& echo VMProtectBegin& echo VMProtectBeginMutation& echo VMProtectBeginUltra& echo VMProtectBeginUltraLockByKey& echo VMProtectBeginVirtualization& echo VMProtectBeginVirtualizationLockByKey& echo VMProtectEnd& echo VMProtectIsDebuggerPresent& echo VMProtectIsVirtualMachinePresent& echo VMProtectIsValidImageCRC& echo VMProtectDecryptStringA& echo VMProtectDecryptStringW& echo VMProtectFreeString& echo VMProtectGetCurrentHWID& echo VMProtectSetSerialNumber& echo VMProtectGetSerialNumberState& echo VMProtectGetSerialNumberData& echo VMProtectActivateLicense& echo VMProtectDeactivateLicense& echo VMProtectGetOfflineActivationString& echo VMProtectGetOfflineDeactivationString) > C:\vmp.def
-          link /NOLOGO /DLL /NOENTRY /MACHINE:X86 /DEF:C:\vmp.def /OUT:%RUNTIMEDLLS%\VMProtectSDK32.dll
+          cd /d C:\Roblox\Source\Library\Qt
+          configure.exe -make nmake -platform win32-msvc2015 -prefix C:\Roblox\Source\Library\Qt -opensource -confirm-license -opengl desktop -nomake examples -nomake tests -webkit -xmlpatterns
+          if errorlevel 1 exit /b 1
+          powershell -NoProfile -Command "Invoke-WebRequest https://download.qt.io/official_releases/jom/jom.zip -OutFile C:\jom.zip; Expand-Archive C:\jom.zip -DestinationPath C:\jom -Force"
+          set PATH=C:\jom;C:\jom\jom;%PATH%
+          jom -j%NUMBER_OF_PROCESSORS% > C:\Roblox\Source\qt_build.log 2>&1
+          echo jom exit code was %errorlevel% - a non-zero code is expected here, per upstream README.
+          if exist lib\QtCore4.lib (echo Qt core library OK) else (
+            powershell -NoProfile -Command "Get-Content C:\Roblox\Source\qt_build.log -Tail 100"
+            exit /b 1
+          )
 
-      # -------------------------------------------------------------
-      # 11. Build the client (Release | Win32). 1.5-3 hours.
-      # -------------------------------------------------------------
       - name: Build WindowsClient
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 -vcvars_ver=14.0
           cd /d C:\Roblox\Source
-          msbuild Roblox.sln /t:WindowsClient /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v140 /m /nologo /v:m /flp:"logfile=C:\build.log;verbosity=normal" /flp2:"logfile=C:\errors.log;errorsonly"
+          "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe" Roblox.sln /t:WindowsClient /p:Configuration=Release /p:Platform=Win32 /m /nologo /flp:"logfile=C:\Roblox\Source\msbuild.log;verbosity=normal" /clp:"ErrorsOnly;Summary"
           if errorlevel 1 (
-            echo === msbuild FAILED - last 60 lines of C:\errors.log: ===
-            type C:\errors.log
+            powershell -NoProfile -Command "Get-Content C:\Roblox\Source\msbuild.log -Tail 120"
             exit /b 1
           )
+          dir C:\Roblox\Source\WindowsClient\Win32\Release\RobloxPlayerBetaRaw.exe
 
-      # -------------------------------------------------------------
-      # 12. Bundle exe + runtime DLLs
-      # -------------------------------------------------------------
-      - name: Collect bundle
+      - name: Copy FMOD DLL next to the exe (if provided in the fork)
+        if: success()
         shell: cmd
-        run: |
-          mkdir C:\Roblox2016Client
-          copy /y %SRC%\WindowsClient\Win32\Release\RobloxPlayerBetaRaw.exe C:\Roblox2016Client\
-          copy /y %RUNTIMEDLLS%\*.dll C:\Roblox2016Client\
-          copy /y %SRC%\WindowsClient\AppSettings.xml C:\Roblox2016Client\
-          rem d3dx9_43.dll from the DirectX redist
-          7z x C:\dxredist.exe -oC:\dxredist -y
-          for /r C:\dxredist %%c in (*d3dx9_43*x86*.cab) do 7z e "%%c" d3dx9_43.dll -oC:\Roblox2016Client -y
-          copy /y C:\Windows\SysWOW64\msvcp140.dll C:\Roblox2016Client\
-          copy /y C:\Windows\SysWOW64\vcruntime140.dll C:\Roblox2016Client\
-          if not exist C:\Roblox2016Client\RobloxPlayerBetaRaw.exe exit /b 1
-          dir C:\Roblox2016Client
+        run: if exist C:\Roblox\Source\fmod\win32\bin\fmod.dll xcopy /Y C:\Roblox\Source\fmod\win32\bin\fmod.dll C:\Roblox\Source\WindowsClient\Win32\Release\
 
-      - name: Upload client bundle
+      - name: Upload client build
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Roblox2016Client
-          path: C:\Roblox2016Client\*
+          name: RobloxPlayerBetaRaw-2016
+          path: |
+            C:/Roblox/Source/WindowsClient/Win32/Release/RobloxPlayerBetaRaw.exe
+            C:/Roblox/Source/WindowsClient/Win32/Release/*.dll
+          if-no-files-found: error
 
       - name: Upload build logs
         if: always()
@@ -307,8 +149,7 @@ jobs:
         with:
           name: build-logs
           path: |
-            C:\build.log
-            C:\errors.log
-            C:\boost_build.log
-            C:\Roblox\Source\Library\boost\bootstrap.log
+            C:/Roblox/Source/boost_b2.log
+            C:/Roblox/Source/qt_build.log
+            C:/Roblox/Source/msbuild.log
           if-no-files-found: ignore
