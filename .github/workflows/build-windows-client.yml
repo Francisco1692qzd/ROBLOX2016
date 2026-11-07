@@ -1,0 +1,99 @@
+name: Build Roblox Windows client (remote runner)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-client:
+    # Register the cloud Windows VM as a self-hosted Actions runner and add
+    # the custom label "v140-xp" after installing the repository's toolchain.
+    runs-on: [self-hosted, windows, x64, v140-xp]
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build Boost with the VS2015 compiler
+        shell: pwsh
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          $boost = Join-Path $root 'Library\boost'
+          $sourceBat = Join-Path $boost 'build_boost.bat'
+
+          if (-not (Test-Path $sourceBat)) {
+            throw "Missing $sourceBat"
+          }
+
+          # The repository's batch file has D:\Roblox\Source hard-coded.
+          # Rewrite that base path for this checkout and remove PAUSE for CI.
+          $text = Get-Content -Raw $sourceBat
+          $text = $text.Replace('D:\Roblox\Source', $root)
+          $text = [regex]::Replace($text, '(?im)^[ \t]*pause[ \t]*\r?\n?', '')
+          $ciBat = Join-Path $boost 'build_boost.ci.bat'
+          Set-Content -Path $ciBat -Value $text -Encoding ASCII
+
+          $vs2015Root = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio 14.0\VC\vcvarsall.bat'
+          if (-not (Test-Path $vs2015Root)) {
+            $vsRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio'
+            $vcvars = Get-ChildItem -Path $vsRoot -Filter 'vcvarsall.bat' -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '14\.0|2015' } |
+              Select-Object -First 1 -ExpandProperty FullName
+          } else {
+            $vcvars = $vs2015Root
+          }
+
+          if (-not $vcvars -or -not (Test-Path $vcvars)) {
+            throw 'VS2015 vcvarsall.bat was not found. Install the VS2015 build tools on this VM.'
+          }
+
+          $lines = @(
+            '@echo off',
+            "call `"$vcvars`" x86",
+            'if errorlevel 1 exit /b %errorlevel%',
+            "cd /d `"$boost`"",
+            'call bootstrap.bat',
+            'if errorlevel 1 exit /b %errorlevel%',
+            'call build_boost.ci.bat',
+            'exit /b %errorlevel%'
+          )
+          $cmdFile = Join-Path $env:RUNNER_TEMP 'build-boost.cmd'
+          Set-Content -Path $cmdFile -Value $lines -Encoding ASCII
+          $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', "`"$cmdFile`"") -Wait -PassThru -NoNewWindow
+          if ($process.ExitCode -ne 0) {
+            throw "Boost build failed with exit code $($process.ExitCode)."
+          }
+
+      - name: Build WindowsClient (Release|Win32)
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) {
+            throw 'vswhere.exe was not found. Install Visual Studio 2019 build tools on this VM.'
+          }
+
+          $vsPath = & $vswhere -latest -products '*' -version '[16.0,17.0)' -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) {
+            throw 'Visual Studio 2019 with MSBuild was not found on this VM.'
+          }
+
+          $msbuild = Join-Path $vsPath 'MSBuild\Current\Bin\MSBuild.exe'
+          if (-not (Test-Path $msbuild)) {
+            throw "MSBuild not found at $msbuild"
+          }
+
+          $solution = Join-Path $env:GITHUB_WORKSPACE 'Roblox.sln'
+          & $msbuild $solution /m /t:WindowsClient:Build /p:Configuration=Release /p:Platform=Win32 /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload client executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: WindowsClient-Release
+          path: '**/RobloxPlayerBetaRaw.exe'
+          if-no-files-found: error
