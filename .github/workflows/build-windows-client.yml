@@ -20,7 +20,7 @@ jobs:
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Restore missing Boost.Thread Win32 sources
+      - name: Restore missing Boost 1.74 sources and headers
         shell: pwsh
         run: |
           $threadDir = Join-Path $env:GITHUB_WORKSPACE 'Library\boost\libs\thread\src\win32'
@@ -28,6 +28,19 @@ jobs:
           $baseUrl = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32'
           foreach ($name in @('thread.cpp', 'tss_dll.cpp', 'tss_pe.cpp')) {
             Invoke-WebRequest -Uri "$baseUrl/$name" -OutFile (Join-Path $threadDir $name)
+          }
+
+          # The vendored include directory also lacks these three Boost 1.74 headers.
+          $includeRoot = Join-Path $env:GITHUB_WORKSPACE 'Library\boost\include'
+          $missingHeaders = @(
+            @{ Path = 'boost\predef\architecture\x86\32.h'; Url = 'https://raw.githubusercontent.com/boostorg/predef/boost-1.74.0/include/boost/predef/architecture/x86/32.h' },
+            @{ Path = 'boost\preprocessor\debug\error.hpp'; Url = 'https://raw.githubusercontent.com/boostorg/preprocessor/boost-1.74.0/include/boost/preprocessor/debug/error.hpp' },
+            @{ Path = 'boost\thread\win32\thread_data.hpp'; Url = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/include/boost/thread/win32/thread_data.hpp' }
+          )
+          foreach ($header in $missingHeaders) {
+            $destination = Join-Path $includeRoot $header.Path
+            New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
+            Invoke-WebRequest -Uri $header.Url -OutFile $destination
           }
 
       - name: Build repository's Boost static library (Release|Win32)
