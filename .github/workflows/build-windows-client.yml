@@ -8,11 +8,10 @@ permissions:
 
 jobs:
   build-windows-client:
-    # GitHub provides this standard runner; no separate cloud VM is needed.
-    # This is an experimental port attempt: the repository targets v140_xp,
-    # while this runner provides Visual Studio 2022 / v143.
+    # Standard GitHub-hosted runner; no VM or payment card is needed for this public fork.
+    # The repo targets v140_xp, so the v143 override below is an experimental port attempt.
     runs-on: windows-2022
-    timeout-minutes: 180
+    timeout-minutes: 120
 
     steps:
       - name: Check out source
@@ -21,136 +20,25 @@ jobs:
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build Boost using Boost 1.74 vc142 compatibility mode
+      - name: Restore missing Boost.Thread Win32 sources
         shell: pwsh
         run: |
-          $root = $env:GITHUB_WORKSPACE
-          $boost = Join-Path $root 'Library\boost'
-          $sourceBat = Join-Path $boost 'build_boost.bat'
-          if (-not (Test-Path $sourceBat)) {
-            throw "Missing $sourceBat"
+          $threadDir = Join-Path $env:GITHUB_WORKSPACE 'Library\boost\libs\thread\src\win32'
+          New-Item -ItemType Directory -Path $threadDir -Force | Out-Null
+          $baseUrl = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32'
+          foreach ($name in @('thread.cpp', 'tss_dll.cpp', 'tss_pe.cpp')) {
+            Invoke-WebRequest -Uri "$baseUrl/$name" -OutFile (Join-Path $threadDir $name)
           }
 
-          # The vendored Boost.Build tree is mismatched/incomplete (it lacks
-          # build-system.jam and build-request.jam). Use the matching official
-          # Boost.Build 1.74.0 source tree instead of fetching files one by one.
-          $archive = Join-Path $env:RUNNER_TEMP 'boost-build-1.74.0.zip'
-          $extract = Join-Path $env:RUNNER_TEMP 'boost-build-1.74.0'
-          Invoke-WebRequest -Uri 'https://github.com/boostorg/build/archive/refs/tags/boost-1.74.0.zip' -OutFile $archive
-          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
-          $sourceRoot = Get-ChildItem -Path $extract -Directory | Select-Object -First 1
-          $matchingSrc = Join-Path $sourceRoot.FullName 'src'
-          if (-not (Test-Path (Join-Path $matchingSrc 'build-system.jam'))) {
-            throw 'Could not find build-system.jam in the Boost.Build 1.74.0 archive.'
-          }
-          $targetSrc = Join-Path $boost 'tools\build\src'
-          if (Test-Path $targetSrc) {
-            Remove-Item -LiteralPath $targetSrc -Recurse -Force
-          }
-          Copy-Item -LiteralPath $matchingSrc -Destination $targetSrc -Recurse -Force
-
-          # The vendored Boost.Thread package is also missing its Windows
-          # implementation files; restore the four files named by its Jamfile.
-          $threadWin32 = Join-Path $boost 'libs\thread\src\win32'
-          New-Item -ItemType Directory -Path $threadWin32 -Force | Out-Null
-          $threadBase = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32'
-          foreach ($name in @('thread.cpp', 'thread_primitives.cpp', 'tss_dll.cpp', 'tss_pe.cpp')) {
-            Invoke-WebRequest -Uri "$threadBase/$name" -OutFile (Join-Path $threadWin32 $name)
-          }
-
-          # Boost 1.74 does not recognize VS2022's toolset name. Use its
-          # supported vc142 compatibility mode with the VS2022 compiler.
-          $text = Get-Content -Raw $sourceBat
-          $text = $text.Replace('D:\Roblox\Source', $root)
-          $text = $text.Replace('--toolset=msvc-14.0', '--toolset=msvc-14.2')
-          $text = [regex]::Replace($text, '(?im)^[ \t]*pause[ \t]*\r?\n?', '')
-          $ciBat = Join-Path $boost 'build_boost.ci.bat'
-          Set-Content -Path $ciBat -Value $text -Encoding ASCII
-
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $vsPath = & $vswhere -latest -products '*' -version '[17.0,18.0)' -property installationPath
-          if (-not $vsPath) {
-            throw 'Visual Studio 2022 was not found on the hosted runner.'
-          }
-          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvarsall.bat'
-          if (-not (Test-Path $vcvars)) {
-            throw "Could not find vcvarsall.bat at $vcvars"
-          }
-          $toolsetRoot = Join-Path $vsPath 'VC\Tools\MSVC'
-          $compilerVersion = Get-ChildItem -Path $toolsetRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          $compiler = Join-Path $compilerVersion.FullName 'bin\Hostx86\x86\cl.exe'
-          if (-not (Test-Path $compiler)) {
-            throw "Could not find the x86 MSVC compiler at $compiler"
-          }
-
-          # Build the B2 engine using Boost 1.74's known vc142 bootstrap mode.
-          $bootstrapLines = @(
-            '@echo off',
-            "call `"$vcvars`" x86",
-            'if errorlevel 1 exit /b %errorlevel%',
-            "cd /d `"$boost`"",
-            'call bootstrap.bat vc142',
-            'exit /b %errorlevel%'
-          )
-          $bootstrapCmd = Join-Path $env:RUNNER_TEMP 'bootstrap-boost.cmd'
-          Set-Content -Path $bootstrapCmd -Value $bootstrapLines -Encoding ASCII
-          $bootstrapProcess = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', "`"$bootstrapCmd`"") -Wait -PassThru -NoNewWindow
-          if ($bootstrapProcess.ExitCode -ne 0) {
-            throw "Boost bootstrap failed with exit code $($bootstrapProcess.ExitCode)."
-          }
-
-          # Boost.Build 1.74 mis-detects VS2022's setup script. Point it directly
-          # at this runner's x86 compiler and the real vcvarsall.bat path.
-          $backslash = [string][char]92
-          $compilerJam = $compiler.Replace($backslash, '/')
-          $vcvarsJam = $vcvars.Replace($backslash, '/')
-          $projectConfig = Join-Path $boost 'project-config.jam'
-          $configLine = "using msvc : 14.2 : `"$compilerJam`" : <setup>`"$vcvarsJam`" ;"
-          Set-Content -Path $projectConfig -Value $configLine -Encoding ASCII
-
-          $buildLines = @(
-            '@echo off',
-            "call `"$vcvars`" x86",
-            'if errorlevel 1 exit /b %errorlevel%',
-            "cd /d `"$boost`"",
-            'call build_boost.ci.bat',
-            'exit /b %errorlevel%'
-          )
-          $buildCmd = Join-Path $env:RUNNER_TEMP 'build-boost-libs.cmd'
-          Set-Content -Path $buildCmd -Value $buildLines -Encoding ASCII
-          $buildProcess = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', "`"$buildCmd`"") -Wait -PassThru -NoNewWindow
-          if ($buildProcess.ExitCode -ne 0) {
-            throw "Boost library build failed with exit code $($buildProcess.ExitCode)."
-          }
-
-      - name: Print Boost logs if an earlier step failed
-        if: failure()
+      - name: Build repository's Boost static library (Release|Win32)
         shell: pwsh
         run: |
-          $boost = Join-Path $env:GITHUB_WORKSPACE 'Library\boost'
-          $logs = @()
-          $bootstrapLog = Join-Path $boost 'bootstrap.log'
-          if (Test-Path $bootstrapLog) {
-            $logs += Get-Item $bootstrapLog
+          $project = Join-Path $env:GITHUB_WORKSPACE 'boostlibs\boost.static.vcxproj'
+          $msbuild = Get-Command msbuild.exe -ErrorAction Stop
+          & $msbuild.Source $project /m /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
           }
-          $logs += Get-ChildItem -Path $boost -Filter '*.log' -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -ne $bootstrapLog } |
-            Select-Object -First 5
-          if (-not $logs) {
-            Write-Host "No .log files found under $boost"
-          }
-          foreach ($log in $logs) {
-            Write-Host "===== $($log.FullName) ====="
-            Get-Content -Path $log.FullName -Tail 250
-          }
-
-      - name: Upload Boost logs if the job failed
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: boost-diagnostics
-          path: Library/boost/**/*.log
-          if-no-files-found: warn
 
       - name: Build WindowsClient (Release|Win32, v143 compatibility attempt)
         shell: pwsh
