@@ -58,6 +58,11 @@ jobs:
           # /XC /XN /XO => copy only files that do not exist in the destination
           robocopy C:\boost74\boost_1_74_0 "$env:SRC\Library\boost" /E /XC /XN /XO /XD doc more test example /NFL /NDL /NJH /NJS | Out-Null
           if ($LASTEXITCODE -ge 8) { throw "robocopy failed with code $LASTEXITCODE" }
+          # The projects include from Library\boost\include (Roblox's own header
+          # copy, not part of the official tree). Fill its missing headers from
+          # the tarball's boost\ (e.g. thread\win32\thread_data.hpp).
+          robocopy C:\boost74\boost_1_74_0\boost "$env:SRC\Library\boost\include\boost" /E /XC /XN /XO /NFL /NDL /NJH /NJS | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy include fill failed with code $LASTEXITCODE" }
           $checks = @(
             'Library\boost\libs\thread\src\win32\thread.cpp',
             'Library\boost\libs\thread\src\win32\tss_dll.cpp',
