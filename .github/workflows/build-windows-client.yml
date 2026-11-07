@@ -21,7 +21,7 @@ jobs:
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build Boost with MSVC 14.3
+      - name: Build Boost using Boost 1.74 vc142 compatibility mode
         shell: pwsh
         run: |
           $root = $env:GITHUB_WORKSPACE
@@ -31,11 +31,11 @@ jobs:
             throw "Missing $sourceBat"
           }
 
-          # Adapt the repository's hard-coded path and old MSVC toolset for
-          # the Visual Studio 2022 compiler on this hosted runner.
+          # Boost 1.74 does not recognize VS2022's toolset name. Use its
+          # supported vc142 compatibility mode with the VS2022 compiler.
           $text = Get-Content -Raw $sourceBat
           $text = $text.Replace('D:\Roblox\Source', $root)
-          $text = $text.Replace('--toolset=msvc-14.0', '--toolset=msvc-14.3')
+          $text = $text.Replace('--toolset=msvc-14.0', '--toolset=msvc-14.2')
           $text = [regex]::Replace($text, '(?im)^[ \t]*pause[ \t]*\r?\n?', '')
           $ciBat = Join-Path $boost 'build_boost.ci.bat'
           Set-Content -Path $ciBat -Value $text -Encoding ASCII
@@ -55,7 +55,7 @@ jobs:
             "call `"$vcvars`" x86",
             'if errorlevel 1 exit /b %errorlevel%',
             "cd /d `"$boost`"",
-            'call bootstrap.bat',
+            'call bootstrap.bat vc142',
             'if errorlevel 1 exit /b %errorlevel%',
             'call build_boost.ci.bat',
             'exit /b %errorlevel%'
