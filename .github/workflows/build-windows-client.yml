@@ -31,13 +31,23 @@ jobs:
             throw "Missing $sourceBat"
           }
 
-          # This repository's vendored Boost.Build tree is missing the main
-          # build-system.jam file required by bootstrap.jam. Fetch the matching
-          # Boost 1.74 file if it is absent.
-          $buildSystemJam = Join-Path $boost 'tools\build\src\build-system.jam'
-          if (-not (Test-Path $buildSystemJam)) {
-            Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/boostorg/build/boost-1.74.0/src/build-system.jam' -OutFile $buildSystemJam
+          # The vendored Boost.Build tree is mismatched/incomplete (it lacks
+          # build-system.jam and build-request.jam). Use the matching official
+          # Boost.Build 1.74.0 source tree instead of fetching files one by one.
+          $archive = Join-Path $env:RUNNER_TEMP 'boost-build-1.74.0.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'boost-build-1.74.0'
+          Invoke-WebRequest -Uri 'https://github.com/boostorg/build/archive/refs/tags/boost-1.74.0.zip' -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+          $sourceRoot = Get-ChildItem -Path $extract -Directory | Select-Object -First 1
+          $matchingSrc = Join-Path $sourceRoot.FullName 'src'
+          if (-not (Test-Path (Join-Path $matchingSrc 'build-system.jam'))) {
+            throw 'Could not find build-system.jam in the Boost.Build 1.74.0 archive.'
           }
+          $targetSrc = Join-Path $boost 'tools\build\src'
+          if (Test-Path $targetSrc) {
+            Remove-Item -LiteralPath $targetSrc -Recurse -Force
+          }
+          Copy-Item -LiteralPath $matchingSrc -Destination $targetSrc -Recurse -Force
 
           # Boost 1.74 does not recognize VS2022's toolset name. Use its
           # supported vc142 compatibility mode with the VS2022 compiler.
