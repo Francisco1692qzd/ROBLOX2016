@@ -56,7 +56,7 @@ jobs:
           tar -xzf $tgz -C C:\boost74
           if (-not (Test-Path C:\boost74\boost_1_74_0\Jamroot)) { throw "Boost tarball extraction failed" }
           # /XC /XN /XO => copy only files that do not exist in the destination
-          robocopy C:\boost74\boost_1_74_0 "$env:SRC\Library\boost" /E /XC /XN /XO /XD doc more /NFL /NDL /NJH /NJS | Out-Null
+          robocopy C:\boost74\boost_1_74_0 "$env:SRC\Library\boost" /E /XC /XN /XO /XD doc more test example /NFL /NDL /NJH /NJS | Out-Null
           if ($LASTEXITCODE -ge 8) { throw "robocopy failed with code $LASTEXITCODE" }
           $checks = @(
             'Library\boost\libs\thread\src\win32\thread.cpp',
@@ -121,7 +121,11 @@ jobs:
           $c = [System.IO.File]::ReadAllText($f)
           $c = $c.Replace('D:\Roblox\Source', 'C:\Roblox\Source')
           $c = $c.Replace('PAUSE', '')
-          $c = $c.Replace('--toolset=msvc-14.0 ^', "--toolset=msvc-14.0 ^`r`n-j4 ^`r`n--without-python ^`r`n--without-mpi ^")
+          # -a forces a full rebuild every time; drop it so a cached stage can be reused incrementally
+          $c = $c.Replace('-a ^', '')
+          # Only the libs the client actually auto-links (verified by grep):
+          # chrono, date_time, filesystem, iostreams, program_options, system, thread
+          $c = $c.Replace('--toolset=msvc-14.0 ^', "--toolset=msvc-14.0 ^`r`n-j4 ^`r`n--with-chrono ^`r`n--with-date_time ^`r`n--with-filesystem ^`r`n--with-iostreams ^`r`n--with-program_options ^`r`n--with-system ^`r`n--with-thread ^")
           $c = $c.Replace('--includedir=C:\Roblox\Source\Library\boost\include', '--includedir=C:\boost-headers-out')
           $c = $c.Replace('--libdir=C:\Roblox\Source\Library\boost\lib', '--stagedir=C:\Roblox\Source\Library\boost\stage')
           [System.IO.File]::WriteAllText($f, $c, (New-Object System.Text.ASCIIEncoding))
@@ -147,7 +151,20 @@ jobs:
           Write-Host "Shim + registry keys written"
 
       # -------------------------------------------------------------
-      # 7. Build Boost 1.74 (x86, release, v140). 30-90 minutes.
+      # 6b. Cache the built Boost stage so re-runs skip the b2 build
+      # -------------------------------------------------------------
+      - name: Cache Boost build
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Roblox\Source\Library\boost\stage
+            C:\Roblox\Source\Library\boost\b2.exe
+            C:\Roblox\Source\Library\boost\project-config.jam
+          key: boost-1.74-v140-x86-v1
+
+      # -------------------------------------------------------------
+      # 7. Build Boost 1.74 (x86, release, v140). ~10-20 minutes for
+      #    the 7 libs the client links.
       #    Dumps bootstrap.log if the engine build fails.
       # -------------------------------------------------------------
       - name: Build Boost
@@ -176,7 +193,28 @@ jobs:
             exit /b 1
           )
           echo === Boost built. stage\lib contents: ===
-          dir C:\Roblox\Source\Library\boost\stage\lib | findstr libboost | more
+          dir C:\Roblox\Source\Library\boost\stage\lib | findstr libboost
+
+      # -------------------------------------------------------------
+      # 7b. Inject MultiProcessorCompilation (/MP) for every project —
+      #     parallelizes cl across cores, ~2x faster client build.
+      #     Directory.Build.props is auto-imported by all vcxproj.
+      # -------------------------------------------------------------
+      - name: Inject /MP parallel compilation
+        shell: pwsh
+        run: |
+          $propsLines = @(
+            '<Project>',
+            '  <ItemDefinitionGroup>',
+            '    <ClCompile>',
+            '      <MultiProcessorCompilation>true</MultiProcessorCompilation>',
+            '      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>',
+            '    </ClCompile>',
+            '  </ItemDefinitionGroup>',
+            '</Project>'
+          )
+          [System.IO.File]::WriteAllLines("$env:SRC\Directory.Build.props", $propsLines, [System.Text.UTF8Encoding]::new($true))
+          Write-Host "Directory.Build.props written:"; Get-Content "$env:SRC\Directory.Build.props"
 
       # -------------------------------------------------------------
       # 8. Patch WindowsClient project (SDL2 lib path fix:
