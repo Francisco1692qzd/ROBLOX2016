@@ -49,6 +49,15 @@ jobs:
           }
           Copy-Item -LiteralPath $matchingSrc -Destination $targetSrc -Recurse -Force
 
+          # The vendored Boost.Thread package is also missing its Windows
+          # implementation files; restore the four files named by its Jamfile.
+          $threadWin32 = Join-Path $boost 'libs\thread\src\win32'
+          New-Item -ItemType Directory -Path $threadWin32 -Force | Out-Null
+          $threadBase = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32'
+          foreach ($name in @('thread.cpp', 'thread_primitives.cpp', 'tss_dll.cpp', 'tss_pe.cpp')) {
+            Invoke-WebRequest -Uri "$threadBase/$name" -OutFile (Join-Path $threadWin32 $name)
+          }
+
           # Boost 1.74 does not recognize VS2022's toolset name. Use its
           # supported vc142 compatibility mode with the VS2022 compiler.
           $text = Get-Content -Raw $sourceBat
@@ -67,22 +76,51 @@ jobs:
           if (-not (Test-Path $vcvars)) {
             throw "Could not find vcvarsall.bat at $vcvars"
           }
+          $toolsetRoot = Join-Path $vsPath 'VC\Tools\MSVC'
+          $compilerVersion = Get-ChildItem -Path $toolsetRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $compiler = Join-Path $compilerVersion.FullName 'bin\Hostx86\x86\cl.exe'
+          if (-not (Test-Path $compiler)) {
+            throw "Could not find the x86 MSVC compiler at $compiler"
+          }
 
-          $lines = @(
+          # Build the B2 engine using Boost 1.74's known vc142 bootstrap mode.
+          $bootstrapLines = @(
             '@echo off',
             "call `"$vcvars`" x86",
             'if errorlevel 1 exit /b %errorlevel%',
             "cd /d `"$boost`"",
             'call bootstrap.bat vc142',
+            'exit /b %errorlevel%'
+          )
+          $bootstrapCmd = Join-Path $env:RUNNER_TEMP 'bootstrap-boost.cmd'
+          Set-Content -Path $bootstrapCmd -Value $bootstrapLines -Encoding ASCII
+          $bootstrapProcess = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', "`"$bootstrapCmd`"") -Wait -PassThru -NoNewWindow
+          if ($bootstrapProcess.ExitCode -ne 0) {
+            throw "Boost bootstrap failed with exit code $($bootstrapProcess.ExitCode)."
+          }
+
+          # Boost.Build 1.74 mis-detects VS2022's setup script. Point it directly
+          # at this runner's x86 compiler and the real vcvarsall.bat path.
+          $backslash = [string][char]92
+          $compilerJam = $compiler.Replace($backslash, '/')
+          $vcvarsJam = $vcvars.Replace($backslash, '/')
+          $projectConfig = Join-Path $boost 'project-config.jam'
+          $configLine = "using msvc : 14.2 : `"$compilerJam`" : <setup>`"$vcvarsJam`" ;"
+          Set-Content -Path $projectConfig -Value $configLine -Encoding ASCII
+
+          $buildLines = @(
+            '@echo off',
+            "call `"$vcvars`" x86",
             'if errorlevel 1 exit /b %errorlevel%',
+            "cd /d `"$boost`"",
             'call build_boost.ci.bat',
             'exit /b %errorlevel%'
           )
-          $cmdFile = Join-Path $env:RUNNER_TEMP 'build-boost.cmd'
-          Set-Content -Path $cmdFile -Value $lines -Encoding ASCII
-          $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', "`"$cmdFile`"") -Wait -PassThru -NoNewWindow
-          if ($process.ExitCode -ne 0) {
-            throw "Boost build failed with exit code $($process.ExitCode)."
+          $buildCmd = Join-Path $env:RUNNER_TEMP 'build-boost-libs.cmd'
+          Set-Content -Path $buildCmd -Value $buildLines -Encoding ASCII
+          $buildProcess = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', "`"$buildCmd`"") -Wait -PassThru -NoNewWindow
+          if ($buildProcess.ExitCode -ne 0) {
+            throw "Boost library build failed with exit code $($buildProcess.ExitCode)."
           }
 
       - name: Print Boost logs if an earlier step failed
