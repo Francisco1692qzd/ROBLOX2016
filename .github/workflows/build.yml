@@ -137,11 +137,9 @@ jobs:
         run: |
           $shimRoot = 'C:\VS2015Shim'
           New-Item -ItemType Directory -Force "$shimRoot\Common7\Tools", "$shimRoot\VC" | Out-Null
-          $shim = @'
-@echo off
-call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" %* -vcvars_ver=14.0
-'@
-          [System.IO.File]::WriteAllText("$shimRoot\VC\vcvarsall.bat", $shim, (New-Object System.Text.ASCIIEncoding))
+          $vsBase = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat'
+          $shimLines = @('@echo off', "call `"$vsBase`" %* -vcvars_ver=14.0")
+          [System.IO.File]::WriteAllLines("$shimRoot\VC\vcvarsall.bat", $shimLines)
           "VS140COMNTOOLS=$shimRoot\Common7\Tools\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           foreach ($view in 'SOFTWARE\Microsoft\VisualStudio\14.0\Setup\VC', 'SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\Setup\VC') {
             reg add "HKLM\$view" /v ProductDir /t REG_SZ /d "$shimRoot\VC\" /f | Out-Null
