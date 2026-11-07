@@ -67,6 +67,35 @@ jobs:
             throw "Boost build failed with exit code $($process.ExitCode)."
           }
 
+      - name: Print Boost logs if an earlier step failed
+        if: failure()
+        shell: pwsh
+        run: |
+          $boost = Join-Path $env:GITHUB_WORKSPACE 'Library\boost'
+          $logs = @()
+          $bootstrapLog = Join-Path $boost 'bootstrap.log'
+          if (Test-Path $bootstrapLog) {
+            $logs += Get-Item $bootstrapLog
+          }
+          $logs += Get-ChildItem -Path $boost -Filter '*.log' -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $bootstrapLog } |
+            Select-Object -First 5
+          if (-not $logs) {
+            Write-Host "No .log files found under $boost"
+          }
+          foreach ($log in $logs) {
+            Write-Host "===== $($log.FullName) ====="
+            Get-Content -Path $log.FullName -Tail 250
+          }
+
+      - name: Upload Boost logs if the job failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boost-diagnostics
+          path: Library/boost/**/*.log
+          if-no-files-found: warn
+
       - name: Build WindowsClient (Release|Win32, v143 compatibility attempt)
         shell: pwsh
         run: |
