@@ -21,7 +21,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/build-client.yml'
+      - '.github/workflows/ci-windows-client.yml'
 
 permissions:
   contents: read
