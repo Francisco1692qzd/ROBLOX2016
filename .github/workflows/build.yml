@@ -1,48 +1,70 @@
 name: Build Roblox 2016 Client
 
 on:
+  push:
+    branches: [master, main]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 350
+    timeout-minutes: 300
 
     steps:
-      # 1. LAUNCH the v140 toolset install in the BACKGROUND - it overlaps
-      #    with the clone/downloads below. Real wait happens in step 7.
-      - name: Start v140 install in background
+      # -----------------------------------------------------------------
+      # 1. Restore the VS2015 (v140_xp) toolchain cached by a previous
+      #    successful run. MUST run before everything else.
+      # -----------------------------------------------------------------
+      - name: Restore VS2015 toolchain cache
+        id: toolcache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            C:\Program Files (x86)\Microsoft Visual Studio 14.0
+            C:\Program Files (x86)\MSBuild
+            C:\Program Files (x86)\Windows Kits\8.1
+            C:\vstoolchain-reg
+          key: vs2015-buildtools-v1
+
+      # -----------------------------------------------------------------
+      # 2. The 2016 client is built with the v140_xp toolset (Visual
+      #    Studio 2015 compiler, Windows XP target). VS2022 does NOT ship
+      #    v140_xp at all, so instead of fighting the VS2022 installer we
+      #    install Microsoft's official "Visual C++ Build Tools 2015" -
+      #    the exact toolchain this code was written for. It supports
+      #    v140_xp + 8.1 SDK natively. Launched in the BACKGROUND so it
+      #    installs while the repo downloads below (~20 min overlap).
+      # -----------------------------------------------------------------
+      - name: Start VS2015 Build Tools install in background
         shell: pwsh
         run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $need = 'Microsoft.VisualStudio.Component.VC.14.00.x86.x64'
-          $have = & $vswhere -latest -products * -requires $need -property installationPath
-          if ($have) {
-            Write-Host "v140 toolset already present - no install needed"
+          $cl = 'C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\bin\cl.exe'
+          if (Test-Path $cl) {
+            Write-Host "VS2015 toolchain already restored from cache - no install needed"
+            "TOOLCHAIN_FRESH=0" | Out-File -Append $env:GITHUB_ENV
           } else {
-            Set-Location "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\"
-            $InstallPath = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
-            $componentsToAdd = @(
-              'Microsoft.VisualStudio.Component.VC.14.00.x86.x64',
-              'Microsoft.VisualStudio.Component.VC.14.00.ATL',
-              'Microsoft.VisualStudio.Component.WinXP',
-              'Microsoft.VisualStudio.Component.Windows81SDK'
-            )
-            $workloadArgs = ($componentsToAdd | ForEach-Object { " --add $_ " }) -join ''
-            $Arguments = ('/c', 'vs_installer.exe', 'modify', '--installPath', "`"$InstallPath`"", $workloadArgs, '--quiet', '--norestart', '--nocache')
-            Start-Process -FilePath cmd.exe -ArgumentList $Arguments -WindowStyle Hidden
-            Write-Host "installer launched in background"
+            Write-Host "Downloading Visual C++ Build Tools 2015 (official Microsoft installer)..."
+            curl.exe -sL -o C:\vcbt2015.exe "https://download.microsoft.com/download/5/f/7/5f7acaeb-8363-451f-9425-68a90f98b238/visualcppbuildtools_full.exe"
+            if (-not (Test-Path C:\vcbt2015.exe)) { Write-Host "FATAL: installer download failed"; exit 1 }
+            if ((Get-Item C:\vcbt2015.exe).Length -lt 1000000) { Write-Host "FATAL: installer download incomplete"; exit 1 }
+            Write-Host "Launching silent full install in the background..."
+            $p = Start-Process -FilePath C:\vcbt2015.exe -ArgumentList '/Q','/L','C:\vcbt_log.txt','/Full' -PassThru -WindowStyle Hidden
+            "VCPBT_PID=$($p.Id)" | Out-File -Append $env:GITHUB_ENV
+            "TOOLCHAIN_FRESH=1" | Out-File -Append $env:GITHUB_ENV
+            Write-Host "installer launched in background (pid $($p.Id))"
           }
 
-      # 2. Restore the prepared source tree from a previous SUCCESSFUL run
+      # -----------------------------------------------------------------
+      # 3. Source tree from a previous SUCCESSFUL run (skips clone +
+      #    downloads + fmod restore on reruns).
+      # -----------------------------------------------------------------
       - name: Restore source cache
         id: srccache
         uses: actions/cache/restore@v4
         with:
           path: C:\Roblox\Source
-          key: roblox-src-v1-${{ github.sha }}
+          key: roblox-src-v5
 
-      # 3. Clone (cache miss only)
       - name: Clone source to C:\Roblox\Source
         if: steps.srccache.outputs.cache-hit != 'true'
         shell: cmd
@@ -50,8 +72,10 @@ jobs:
           git config --global core.longpaths true
           git clone --depth 1 https://github.com/Artifaqt/ROBLOX2016.git C:\Roblox\Source
 
-      # 4. Clean Boost 1.56.0 SOURCE only - no compiler build, boost.static
-      #    handles that inside msbuild
+      # Clean Boost 1.56.0 SOURCE only (repo copy is broken). There is no
+      # separate b2 build: the solution's own boostlibs\boost.static.vcxproj
+      # compiles the boost .cpp files the client needs, with the same
+      # v140_xp compiler, during the main build.
       - name: Download clean Boost 1.56.0 source
         if: steps.srccache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -63,7 +87,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "C:\Roblox\Source\Library\boost\include" | Out-Null
           Copy-Item "C:\Roblox\Source\Library\boost\boost" "C:\Roblox\Source\Library\boost\include\boost" -Recurse -Force
 
-      # 5. Restore the missing fmod folder via sparse clone (fast)
+      # Restore the fmod folder the leak is missing (FMOD 1.07.02, 32-bit)
+      # via a sparse clone - only downloads that one folder.
       - name: Restore missing fmod folder
         if: steps.srccache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -74,53 +99,127 @@ jobs:
           git -C "$env:TEMP\fmodrepo" sparse-checkout set fmod
           Copy-Item "$env:TEMP\fmodrepo\fmod" "C:\Roblox\Source\fmod" -Recurse -Force
 
-      # 6. Junction insurance (leak scripts hardcode D:\Roblox\Source)
       - name: Map D:\Roblox\Source -> C:\Roblox\Source
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "D:\Roblox" -Force | Out-Null
           New-Item -ItemType Junction -Path "D:\Roblox\Source" -Target "C:\Roblox\Source" | Out-Null
 
-      # 7. Poll until v140 is REALLY registered (installer ran during steps 2-6)
-      - name: Wait for v140 toolset
+      # -----------------------------------------------------------------
+      # 4. The installer has been overlapping the steps above. Wait for
+      #    it, verify the compiler is REALLY there, and on failure dump
+      #    the installer logs so we never guess again.
+      # -----------------------------------------------------------------
+      - name: Wait for VS2015 Build Tools to finish
+        if: env.VCPBT_PID != ''
         shell: pwsh
-        timeout-minutes: 25
+        timeout-minutes: 65
         run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $need = 'Microsoft.VisualStudio.Component.VC.14.00.x86.x64'
-          $deadline = (Get-Date).AddMinutes(20)
-          Write-Host "Polling for v140 toolset registration..."
+          Write-Host "Waiting for the installer process (pid $env:VCPBT_PID)..."
+          Wait-Process -Id $env:VCPBT_PID -Timeout 2100 -ErrorAction SilentlyContinue
+          $cl = 'C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\bin\cl.exe'
+          $deadline = (Get-Date).AddMinutes(25)
           do {
-            $have = & $vswhere -latest -products * -requires $need -property installationPath
-            if ($have) { break }
             Start-Sleep -Seconds 15
-          } until ((Get-Date) -gt $deadline)
-          if (-not $have) {
-            Write-Host "ERROR: v140 toolset did not appear in time."
+            $ok = Test-Path $cl
+          } until ($ok -or ((Get-Date) -gt $deadline))
+          if (-not $ok) {
+            Write-Host "ERROR: cl.exe never appeared. Installer log tail:"
+            if (Test-Path C:\vcbt_log.txt) { Get-Content C:\vcbt_log.txt -Tail 60 }
+            Write-Host "---- recent VS setup logs ----"
+            Get-ChildItem $env:TEMP -Filter 'dd_*' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 6 |
+              ForEach-Object { Write-Host "== $($_.Name) =="; Get-Content $_.FullName -Tail 20 }
             exit 1
           }
-          Write-Host "v140 toolset confirmed at: $have"
+          Write-Host "VS2015 toolchain installed:"
+          $ver = & $cl 2>&1 | Select-Object -First 1
+          Write-Host "$ver"
+          Write-Host ("8.1 SDK present : " + (Test-Path 'C:\Program Files (x86)\Windows Kits\8.1\Include'))
+          Write-Host ("ATL/MFC present : " + (Test-Path 'C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\atlmfc'))
+          Write-Host ("v140_xp props   : " + (Test-Path 'C:\Program Files (x86)\MSBuild\Microsoft\VisualStudio\v14.0\Platforms\Win32\PlatformToolsets\v140_xp'))
+          # Snapshot the registry entries MSBuild needs, so future cached
+          # runs can restore them without reinstalling anything.
+          New-Item -ItemType Directory -Path C:\vstoolchain-reg -Force | Out-Null
+          reg export "HKLM\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\SxS" C:\vstoolchain-reg\sxs.reg /y | Out-Null
+          reg export "HKLM\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0" C:\vstoolchain-reg\vs14.reg /y | Out-Null
+          reg export "HKLM\SOFTWARE\WOW6432Node\Microsoft\MSBuild" C:\vstoolchain-reg\msbuild.reg /y | Out-Null
+          reg export "HKLM\SOFTWARE\WOW6432Node\Microsoft\Microsoft SDKs\Windows\v8.1" C:\vstoolchain-reg\sdk81.reg /y | Out-Null
 
-      # 8. Build ONLY the client (references pull in everything else)
+      # Cached toolchain runs: put the saved registry entries back.
+      - name: Import toolchain registry
+        if: env.VCPBT_PID == ''
+        shell: cmd
+        run: |
+          if exist C:\vstoolchain-reg\sxs.reg reg import C:\vstoolchain-reg\sxs.reg
+          if exist C:\vstoolchain-reg\vs14.reg reg import C:\vstoolchain-reg\vs14.reg
+          if exist C:\vstoolchain-reg\msbuild.reg reg import C:\vstoolchain-reg\msbuild.reg
+          if exist C:\vstoolchain-reg\sdk81.reg reg import C:\vstoolchain-reg\sdk81.reg
+
+      # -----------------------------------------------------------------
+      # 5. Build ONLY the client with the genuine VS2015 toolchain.
+      #    Project references pull in App, Base, Network, GfxCore, GfxRender,
+      #    Log, BulletPhysics, CSG, the gfx libs and boost.static
+      #    automatically. Never "Rebuild Solution".
+      # -----------------------------------------------------------------
       - name: Build WindowsClient
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 -vcvars_ver=14.0
+          call "C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\vcvarsall.bat" x86
           cd /d C:\Roblox\Source
-          msbuild Roblox.sln /t:WindowsClient /p:Configuration=Release /p:Platform=Win32 /p:MultiProcessorCompilation=true /m /v:m /nologo
+          "C:\Program Files (x86)\MSBuild\14.0\Bin\MSBuild.exe" Roblox.sln /t:WindowsClient /p:Configuration=Release /p:Platform=Win32 /p:MultiProcessorCompilation=true /m /v:m /nologo
 
-      # 9. Get the exe from the run's "Artifacts" section
-      - name: Upload exe
+      # -----------------------------------------------------------------
+      # 6. Artifact: the exe + the 32-bit fmod.dll it needs at runtime.
+      # -----------------------------------------------------------------
+      - name: Stage exe + fmod.dll
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path C:\artifact -Force | Out-Null
+          Copy-Item "C:\Roblox\Source\WindowsClient\Win32\Release\*.exe" C:\artifact -Force
+          $dll = Get-ChildItem "C:\Roblox\Source\fmod" -Recurse -Filter fmod.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($dll) {
+            Copy-Item $dll.FullName C:\artifact -Force
+            Write-Host "fmod.dll staged from: $($dll.FullName)"
+          } else {
+            Write-Host "NOTE: no fmod.dll found - the exe needs it next to it at runtime"
+          }
+          Get-ChildItem C:\artifact | Format-Table Name, Length
+
+      - name: Upload client
         uses: actions/upload-artifact@v4
         with:
           name: roblox-2016-client
-          path: C:\Roblox\Source\WindowsClient\Win32\Release\*.exe
+          path: C:\artifact
           if-no-files-found: error
 
-      # 10. Cache the tree - ONLY on success, failures can't poison it
+      # -----------------------------------------------------------------
+      # 7. Save caches - ONLY on success, so a failed compile can never
+      #    poison them. After one fully green run, reruns skip the clone,
+      #    downloads, the toolchain install, AND already-compiled objects
+      #    (incremental rebuild = minutes, not an hour).
+      # -----------------------------------------------------------------
+      - name: Slim source tree before caching
+        if: success() && steps.srccache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          if (Test-Path 'C:\Roblox\Source\.git') { Remove-Item 'C:\Roblox\Source\.git' -Recurse -Force }
+          Write-Host ".git removed to keep the cache under GitHub's 10 GB limit"
+
       - name: Save source cache
         if: success() && steps.srccache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: C:\Roblox\Source
-          key: roblox-src-v1-${{ github.sha }}
+          key: roblox-src-v5
+
+      - name: Save VS2015 toolchain cache
+        if: success() && env.TOOLCHAIN_FRESH == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            C:\Program Files (x86)\Microsoft Visual Studio 14.0
+            C:\Program Files (x86)\MSBuild
+            C:\Program Files (x86)\Windows Kits\8.1
+            C:\vstoolchain-reg
+          key: vs2015-buildtools-v1
