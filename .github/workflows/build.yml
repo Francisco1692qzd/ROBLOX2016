@@ -16,15 +16,34 @@ jobs:
           git config --global core.longpaths true
           git clone --depth 1 https://github.com/Artifaqt/ROBLOX2016.git C:\Roblox\Source
 
-      # 2. build_boost.bat hardcodes D:\Roblox\Source\... — junction fixes it
+      # 2. The 2016 code was written for the VS2015 compiler (v140/v140_xp).
+      #    GitHub's runner image does NOT ship it, so we install it (~10 min).
+      - name: Install VS2015 (v140) toolset
+        shell: pwsh
+        timeout-minutes: 25
+        run: |
+          $setup = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe"
+          $installPath = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+          $argList = @(
+            'modify',
+            "--installPath `"$installPath`"",
+            '--add', 'Microsoft.VisualStudio.Component.VC.14.00.x86.x64',
+            '--add', 'Microsoft.VisualStudio.Component.VC.14.00.ATL',
+            '--add', 'Microsoft.VisualStudio.Component.Windows81SDK',
+            '--quiet', '--norestart', '--nocache'
+          )
+          $p = Start-Process -FilePath $setup -ArgumentList $argList -Wait -PassThru
+          Write-Host "VS installer exit code: $($p.ExitCode)"
+          exit $p.ExitCode
+
+      # 3. build_boost.bat hardcodes D:\Roblox\Source\... paths — junction fixes it
       - name: Map D:\Roblox\Source -> C:\Roblox\Source
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "D:\Roblox" -Force | Out-Null
           New-Item -ItemType Junction -Path "D:\Roblox\Source" -Target "C:\Roblox\Source" | Out-Null
 
-      # 3. The leak is MISSING the "fmod" folder the vcxproj needs.
-      #    Exact version used: FMOD Studio low-level API 1.07.02 (32-bit).
+      # 4. Restore the fmod folder the vcxproj needs (FMOD 1.07.02, 32-bit)
       - name: Restore missing fmod folder
         shell: pwsh
         run: |
@@ -42,7 +61,7 @@ jobs:
           }
           Get-ChildItem $out -Recurse -File | Select-Object Name, Length
 
-      # 4. Boost 1.56.0 — repo copy is broken (see Library/README.md)
+      # 5. Boost 1.56.0 — repo copy is broken (see Library/README.md)
       - name: Download clean Boost 1.56.0
         shell: pwsh
         run: |
@@ -51,43 +70,29 @@ jobs:
           Expand-Archive "$env:TEMP\boost.zip" "$env:TEMP\boost" -Force
           Copy-Item "$env:TEMP\boost\boost_1_56_0\*" "C:\Roblox\Source\Library\boost\" -Recurse -Force
 
-      # 5. Qt 4.8.5 — same deal
-      - name: Download clean Qt 4.8.5
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          curl.exe -L -o "$env:TEMP\qt.zip" "https://download.qt.io/archive/qt/4.8/4.8.5/qt-everywhere-opensource-src-4.8.5.zip"
-          Expand-Archive "$env:TEMP\qt.zip" "$env:TEMP\qt" -Force
-          Copy-Item "$env:TEMP\qt\qt-everywhere-opensource-src-4.8.5\*" "C:\Roblox\Source\Library\Qt\" -Recurse -Force
-
-      # 6. Build Boost. <nul matters: the bat ends with PAUSE and would hang the runner.
+      # 6. Build Boost — same flags as the repo's bat, plus -j4 (4 cores instead of 1)
       - name: Build Boost
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 -vcvars_ver=14.0
           cd /d C:\Roblox\Source\Library\boost
           call bootstrap.bat
-          cmd /c "build_boost.bat <nul"
+          b2 stage -a --reconfigure --toolset=msvc-14.0 --variant=release -j4 ^
+            -s ZLIB_SOURCE=D:\Roblox\Source\Library\zlib\include\zlib ^
+            -s ZLIB_BINARY=D:\Roblox\Source\Library\zlib\lib\release ^
+            --prefix=D:\Roblox\Source\Library\boost ^
+            --libdir=D:\Roblox\Source\Library\boost\lib ^
+            --includedir=D:\Roblox\Source\Library\boost\include
 
-      # 7. Build Qt (the long one, ~1-2.5 h). Errors at the very END are normal
-      #    as long as the .lib files appear in Library\Qt\lib.
-      - name: Build Qt 4.8.5
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 -vcvars_ver=14.0
-          cd /d C:\Roblox\Source\Library\Qt
-          configure -release -opensource -confirm-license -fast -no-webkit -nomake demos -nomake examples -nomake tools
-          nmake sub-src
-
-      # 8. Build ONLY the client (Xbox/Mac/Android/iOS projects are broken — never "Rebuild Solution")
+      # 7. Build ONLY the client (never "Rebuild Solution" — other projects are broken)
       - name: Build WindowsClient
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 -vcvars_ver=14.0
           cd /d C:\Roblox\Source
-          msbuild Roblox.sln /t:WindowsClient /p:Configuration=Release /p:Platform=Win32 /m /v:m /nologo
+          msbuild Roblox.sln /t:WindowsClient /p:Configuration=Release /p:Platform=Win32 /p:MultiProcessorCompilation=true /m /v:m /nologo
 
-      # 9. Get the exe from the run's "Artifacts" section
+      # 8. Get the exe from the run's "Artifacts" section
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:
