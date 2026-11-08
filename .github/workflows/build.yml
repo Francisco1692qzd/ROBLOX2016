@@ -9,82 +9,99 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      # 1. Clone straight to C:\Roblox\Source (big repo + deep paths)
+      # 1. LAUNCH the v140 toolset install in the BACKGROUND - it overlaps
+      #    with the clone/downloads below. Real wait happens in step 7.
+      - name: Start v140 install in background
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $need = 'Microsoft.VisualStudio.Component.VC.14.00.x86.x64'
+          $have = & $vswhere -latest -products * -requires $need -property installationPath
+          if ($have) {
+            Write-Host "v140 toolset already present - no install needed"
+          } else {
+            Set-Location "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\"
+            $InstallPath = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+            $componentsToAdd = @(
+              'Microsoft.VisualStudio.Component.VC.14.00.x86.x64',
+              'Microsoft.VisualStudio.Component.VC.14.00.ATL',
+              'Microsoft.VisualStudio.Component.WinXP',
+              'Microsoft.VisualStudio.Component.Windows81SDK'
+            )
+            $workloadArgs = ($componentsToAdd | ForEach-Object { " --add $_ " }) -join ''
+            $Arguments = ('/c', 'vs_installer.exe', 'modify', '--installPath', "`"$InstallPath`"", $workloadArgs, '--quiet', '--norestart', '--nocache')
+            Start-Process -FilePath cmd.exe -ArgumentList $Arguments -WindowStyle Hidden
+            Write-Host "installer launched in background"
+          }
+
+      # 2. Restore the prepared source tree from a previous SUCCESSFUL run
+      - name: Restore source cache
+        id: srccache
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\Roblox\Source
+          key: roblox-src-v1-${{ github.sha }}
+
+      # 3. Clone (cache miss only)
       - name: Clone source to C:\Roblox\Source
+        if: steps.srccache.outputs.cache-hit != 'true'
         shell: cmd
         run: |
           git config --global core.longpaths true
           git clone --depth 1 https://github.com/Artifaqt/ROBLOX2016.git C:\Roblox\Source
 
-      # 2. The 2016 code was written for the VS2015 compiler (v140/v140_xp).
-      #    GitHub's runner image does NOT ship it, so we install it (~10 min).
-      - name: Install VS2015 (v140) toolset
-        shell: pwsh
-        timeout-minutes: 25
-        run: |
-          $setup = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe"
-          $installPath = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
-          $argList = @(
-            'modify',
-            "--installPath `"$installPath`"",
-            '--add', 'Microsoft.VisualStudio.Component.VC.14.00.x86.x64',
-            '--add', 'Microsoft.VisualStudio.Component.VC.14.00.ATL',
-            '--add', 'Microsoft.VisualStudio.Component.Windows81SDK',
-            '--quiet', '--norestart', '--nocache'
-          )
-          $p = Start-Process -FilePath $setup -ArgumentList $argList -Wait -PassThru
-          Write-Host "VS installer exit code: $($p.ExitCode)"
-          exit $p.ExitCode
-
-      # 3. build_boost.bat hardcodes D:\Roblox\Source\... paths — junction fixes it
-      - name: Map D:\Roblox\Source -> C:\Roblox\Source
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path "D:\Roblox" -Force | Out-Null
-          New-Item -ItemType Junction -Path "D:\Roblox\Source" -Target "C:\Roblox\Source" | Out-Null
-
-      # 4. Restore the fmod folder the vcxproj needs (FMOD 1.07.02, 32-bit)
-      - name: Restore missing fmod folder
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $base = "https://raw.githubusercontent.com/drippypop/rbx2016/main/fmod"
-          $out  = "C:\Roblox\Source\fmod"
-          New-Item -ItemType Directory -Force -Path "$out\include", "$out\win32\lib" | Out-Null
-          $files = @(
-            "include\fmod.h", "include\fmod.hpp", "include\fmod_common.h",
-            "include\fmod_dsp.h", "include\fmod_errors.h",
-            "win32\lib\fmod_vc.lib"
-          )
-          foreach ($f in $files) {
-            Invoke-WebRequest -Uri "$base/$($f -replace '\\','/')" -OutFile "$out\$f"
-          }
-          Get-ChildItem $out -Recurse -File | Select-Object Name, Length
-
-      # 5. Boost 1.56.0 — repo copy is broken (see Library/README.md)
-      - name: Download clean Boost 1.56.0
+      # 4. Clean Boost 1.56.0 SOURCE only - no compiler build, boost.static
+      #    handles that inside msbuild
+      - name: Download clean Boost 1.56.0 source
+        if: steps.srccache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           curl.exe -L -o "$env:TEMP\boost.zip" "https://archives.boost.io/release/1.56.0/source/boost_1_56_0.zip"
           Expand-Archive "$env:TEMP\boost.zip" "$env:TEMP\boost" -Force
           Copy-Item "$env:TEMP\boost\boost_1_56_0\*" "C:\Roblox\Source\Library\boost\" -Recurse -Force
+          New-Item -ItemType Directory -Force -Path "C:\Roblox\Source\Library\boost\include" | Out-Null
+          Copy-Item "C:\Roblox\Source\Library\boost\boost" "C:\Roblox\Source\Library\boost\include\boost" -Recurse -Force
 
-      # 6. Build Boost — same flags as the repo's bat, plus -j4 (4 cores instead of 1)
-      - name: Build Boost
-        shell: cmd
+      # 5. Restore the missing fmod folder via sparse clone (fast)
+      - name: Restore missing fmod folder
+        if: steps.srccache.outputs.cache-hit != 'true'
+        shell: pwsh
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 -vcvars_ver=14.0
-          cd /d C:\Roblox\Source\Library\boost
-          call bootstrap.bat
-          b2 stage -a --reconfigure --toolset=msvc-14.0 --variant=release -j4 ^
-            -s ZLIB_SOURCE=D:\Roblox\Source\Library\zlib\include\zlib ^
-            -s ZLIB_BINARY=D:\Roblox\Source\Library\zlib\lib\release ^
-            --prefix=D:\Roblox\Source\Library\boost ^
-            --libdir=D:\Roblox\Source\Library\boost\lib ^
-            --includedir=D:\Roblox\Source\Library\boost\include
+          $ErrorActionPreference = "Stop"
+          git config --global core.longpaths true
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/drippypop/rbx2016.git "$env:TEMP\fmodrepo"
+          git -C "$env:TEMP\fmodrepo" sparse-checkout set fmod
+          Copy-Item "$env:TEMP\fmodrepo\fmod" "C:\Roblox\Source\fmod" -Recurse -Force
 
-      # 7. Build ONLY the client (never "Rebuild Solution" — other projects are broken)
+      # 6. Junction insurance (leak scripts hardcode D:\Roblox\Source)
+      - name: Map D:\Roblox\Source -> C:\Roblox\Source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "D:\Roblox" -Force | Out-Null
+          New-Item -ItemType Junction -Path "D:\Roblox\Source" -Target "C:\Roblox\Source" | Out-Null
+
+      # 7. Poll until v140 is REALLY registered (installer ran during steps 2-6)
+      - name: Wait for v140 toolset
+        shell: pwsh
+        timeout-minutes: 25
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $need = 'Microsoft.VisualStudio.Component.VC.14.00.x86.x64'
+          $deadline = (Get-Date).AddMinutes(20)
+          Write-Host "Polling for v140 toolset registration..."
+          do {
+            $have = & $vswhere -latest -products * -requires $need -property installationPath
+            if ($have) { break }
+            Start-Sleep -Seconds 15
+          } until ((Get-Date) -gt $deadline)
+          if (-not $have) {
+            Write-Host "ERROR: v140 toolset did not appear in time."
+            exit 1
+          }
+          Write-Host "v140 toolset confirmed at: $have"
+
+      # 8. Build ONLY the client (references pull in everything else)
       - name: Build WindowsClient
         shell: cmd
         run: |
@@ -92,10 +109,18 @@ jobs:
           cd /d C:\Roblox\Source
           msbuild Roblox.sln /t:WindowsClient /p:Configuration=Release /p:Platform=Win32 /p:MultiProcessorCompilation=true /m /v:m /nologo
 
-      # 8. Get the exe from the run's "Artifacts" section
+      # 9. Get the exe from the run's "Artifacts" section
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:
           name: roblox-2016-client
           path: C:\Roblox\Source\WindowsClient\Win32\Release\*.exe
           if-no-files-found: error
+
+      # 10. Cache the tree - ONLY on success, failures can't poison it
+      - name: Save source cache
+        if: success() && steps.srccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\Roblox\Source
+          key: roblox-src-v1-${{ github.sha }}
