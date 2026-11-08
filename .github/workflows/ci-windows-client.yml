@@ -169,6 +169,44 @@ jobs:
           path: C:\artifact
           if-no-files-found: warn
 
+      # Run logs and artifacts need a signed-in session, so publish the real
+      # compiler errors into the run summary page, which is public.
+      - name: Publish build diagnostics summary
+        if: always()
+        shell: pwsh
+        run: |
+          $log = 'C:\bld\build.log'
+          if (-not (Test-Path $log)) { Write-Host 'no build log'; exit 0 }
+          $lines = Get-Content $log
+          Write-Host "log lines: $($lines.Count)"
+
+          $errors = $lines | Select-String -Pattern 'error\s+[A-Z]+[0-9]+|error MSB[0-9]+|fatal error' | Select-Object -First 60
+          $warns  = $lines | Select-String -Pattern 'warning\s+[A-Z]+[0-9]+' | Select-Object -First 10
+          $head   = $lines | Select-Object -First 40
+          $tail   = $lines | Select-Object -Last 60
+
+          $sb = New-Object System.Text.StringBuilder
+          [void]$sb.AppendLine('### Build diagnostics')
+          [void]$sb.AppendLine('')
+          [void]$sb.AppendLine("Total log lines: $($lines.Count)")
+          [void]$sb.AppendLine("Error lines found: $($errors.Count)")
+          [void]$sb.AppendLine('')
+          [void]$sb.AppendLine('#### Errors')
+          [void]$sb.AppendLine('```')
+          if ($errors) { foreach ($e in $errors) { [void]$sb.AppendLine($e.Line.Trim()) } } else { [void]$sb.AppendLine('(no error lines matched)') }
+          [void]$sb.AppendLine('```')
+          [void]$sb.AppendLine('#### First 40 lines')
+          [void]$sb.AppendLine('```')
+          foreach ($l in $head) { [void]$sb.AppendLine($l) }
+          [void]$sb.AppendLine('```')
+          [void]$sb.AppendLine('#### Last 60 lines')
+          [void]$sb.AppendLine('```')
+          foreach ($l in $tail) { [void]$sb.AppendLine($l) }
+          [void]$sb.AppendLine('```')
+
+          $sb.ToString() | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host 'summary written'
+
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
