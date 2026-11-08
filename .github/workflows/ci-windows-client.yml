@@ -207,6 +207,22 @@ jobs:
           $sb.ToString() | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           Write-Host 'summary written'
 
+          # Annotations are visible without signing in, so surface the first
+          # real failures there too. GitHub shows at most 10 per step.
+          $shown = 0
+          foreach ($e in $errors) {
+            if ($shown -ge 10) { break }
+            $msg = $e.Line.Trim() -replace '%','%25' -replace "`r",'' -replace "`n",' '
+            if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) }
+            Write-Host "::error title=MSBuild failure::$msg"
+            $shown++
+          }
+          if ($shown -eq 0) {
+            $last = ($tail -join ' | ')
+            if ($last.Length -gt 400) { $last = $last.Substring($last.Length - 400) }
+            Write-Host "::error title=MSBuild failure (no error lines)::$last"
+          }
+
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
