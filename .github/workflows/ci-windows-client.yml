@@ -1,0 +1,182 @@
+name: Build client (fixed)
+
+# Builds the WindowsClient from this repo on a GitHub-hosted runner.
+#
+# Differences from .github/workflows/build.yml (which never reached the
+# compile step on any run):
+#   * Boost is repaired in place. The repo is missing the three
+#     boost.thread Win32 sources and one public header that
+#     boostlibs/boost.static.vcxproj explicitly compiles, so that project
+#     can never build as-is.
+#   * The v140 (VS2015) toolchain is attempted first, because that is what
+#     the projects declare (v140_xp) and what the README documents. If the
+#     2015 installer does not complete, we fall back to the toolset that is
+#     actually present in the image and retarget the projects, so the run
+#     still produces real compiler output instead of a toolchain timeout.
+#   * The MSBuild console log and a binary log are uploaded on every run,
+#     including failures, so the compile diagnostics are readable.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-client.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    steps:
+      - name: Enable long paths before checkout
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force | Out-Null
+          Write-Host "long paths enabled"
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # These four files are referenced by boostlibs/boost.static.vcxproj but
+      # do not exist in the repo. Without them that project fails instantly.
+      - name: Repair missing Boost 1.74 sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE 'Library\boost\libs\thread\src\win32'
+          $inc = Join-Path $env:GITHUB_WORKSPACE 'Library\boost\include\boost\thread\win32'
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+          New-Item -ItemType Directory -Force -Path $inc | Out-Null
+
+          $files = @(
+            @{ Url = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32/thread.cpp';                     Dest = Join-Path $src 'thread.cpp' },
+            @{ Url = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32/tss_dll.cpp';                    Dest = Join-Path $src 'tss_dll.cpp' },
+            @{ Url = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32/tss_pe.cpp';                     Dest = Join-Path $src 'tss_pe.cpp' },
+            @{ Url = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/include/boost/thread/win32/thread_primitives.hpp'; Dest = Join-Path $inc 'thread_primitives.hpp' }
+          )
+          foreach ($f in $files) {
+            curl.exe -sSL --retry 3 --retry-delay 5 -o $f.Dest $f.Url
+            if (-not (Test-Path $f.Dest)) { throw "download failed: $($f.Url)" }
+            $len = (Get-Item $f.Dest).Length
+            if ($len -lt 500) { throw "download too small ($len bytes): $($f.Url)" }
+            Write-Host ("ok {0,7} bytes  {1}" -f $len, $f.Dest)
+          }
+
+      # ---------------------------------------------------------------
+      # Preferred toolchain: the real VS2015 build tools (v140), which is
+      # what the vcxproj files declare and what the README documents.
+      # Non-fatal: if it cannot complete we retarget below instead.
+      # ---------------------------------------------------------------
+      - name: Try installing VS2015 build tools (v140)
+        id: vs2015
+        shell: pwsh
+        timeout-minutes: 60
+        run: |
+          $cl = 'C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\bin\cl.exe'
+          if (Test-Path $cl) { Write-Host 'v140 already present'; "GOT_V140=1" | Out-File -Append $env:GITHUB_ENV; exit 0 }
+          try {
+            $url = 'https://download.microsoft.com/download/5/f/7/5f7acaeb-8363-451f-9425-68a90f98b238/visualcppbuildtools_full.exe'
+            curl.exe -sSL --retry 3 -o C:\vcbt2015.exe $url
+            if (-not (Test-Path C:\vcbt2015.exe) -or (Get-Item C:\vcbt2015.exe).Length -lt 1000000) { throw 'installer download failed' }
+            Write-Host 'running silent install (this can take 30-45 min)...'
+            Start-Process -FilePath C:\vcbt2015.exe -ArgumentList '/Q','/Full','/NoRestart','/L','C:\vcbt_log.txt' -Wait -WindowStyle Hidden
+          } catch {
+            Write-Host "installer problem: $_"
+          }
+          if (Test-Path $cl) {
+            Write-Host 'SUCCESS: v140 toolchain available'
+            "GOT_V140=1" | Out-File -Append $env:GITHUB_ENV
+          } else {
+            Write-Host 'v140 not available - will retarget the projects'
+            "GOT_V140=0" | Out-File -Append $env:GITHUB_ENV
+            if (Test-Path C:\vcbt_log.txt) { Get-Content C:\vcbt_log.txt -Tail 40 }
+          }
+
+      - name: Pick and apply toolset
+        shell: pwsh
+        run: |
+          if ($env:GOT_V140 -eq '1') {
+            Write-Host 'Using the projects as-is (v140_xp).'
+            # MSBuild 14 from the 2015 build tools.
+            "MSBUILD_EXE=C:\Program Files (x86)\MSBuild\14.0\Bin\MSBuild.exe" | Out-File -Append $env:GITHUB_ENV
+            exit 0
+          }
+
+          # Fallback: retarget the projects to the toolset this image really has.
+          $msbuild = (Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter MSBuild.exe -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -match '\\Bin\\MSBuild\.exe$' } | Select-Object -First 1).FullName
+          if (-not $msbuild) { throw 'no MSBuild found' }
+          $toolset = 'v143'
+          Write-Host "Falling back to $toolset using $msbuild"
+          "MSBUILD_EXE=$msbuild" | Out-File -Append $env:GITHUB_ENV
+
+          $changed = 0
+          Get-ChildItem $env:GITHUB_WORKSPACE -Recurse -Include *.vcxproj,*.props,*.targets |
+            Where-Object { $_.FullName -notmatch '\\Library\\' } | ForEach-Object {
+              $text = Get-Content $_.FullName -Raw
+              $new  = $text -replace '<PlatformToolset>v140_xp</PlatformToolset>', "<PlatformToolset>$toolset</PlatformToolset>" `
+                           -replace '<PlatformToolset>v140</PlatformToolset>',    "<PlatformToolset>$toolset</PlatformToolset>"
+              if ($new -ne $text) { Set-Content -Path $_.FullName -Value $new -NoNewline -Encoding UTF8; $script:changed++ }
+            }
+          Write-Host "retargeted $changed project file(s) to $toolset"
+
+      - name: Build WindowsClient (Release|Win32)
+        shell: pwsh
+        run: |
+          $msbuild = $env:MSBUILD_EXE
+          $sln     = Join-Path $env:GITHUB_WORKSPACE 'Roblox.sln'
+          Write-Host "MSBuild : $msbuild"
+          Write-Host "Solution: $sln"
+          New-Item -ItemType Directory -Force -Path C:\bld | Out-Null
+          & $msbuild $sln /t:WindowsClient /p:Configuration=Release /p:Platform=Win32 `
+              /p:MultiProcessorCompilation=true /m /v:m /nologo `
+              /bl:C:\bld\build.binlog 2>&1 | Tee-Object -FilePath C:\bld\build.log
+          $code = $LASTEXITCODE
+          Write-Host "MSBuild exit code: $code"
+          exit $code
+
+      - name: Stage exe and runtime DLLs
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\artifact | Out-Null
+          $out = Join-Path $env:GITHUB_WORKSPACE 'WindowsClient\Win32\Release'
+          if (Test-Path $out) {
+            Copy-Item "$out\*.exe" C:\artifact -Force -ErrorAction SilentlyContinue
+            Get-ChildItem C:\artifact | Format-Table Name, Length
+          } else {
+            Write-Host "no output directory: $out"
+          }
+          # Runtime DLLs the client loads next to the exe, when present.
+          foreach ($pattern in @('fmod.dll','SDL2.dll','d3dcompiler_47.dll','openvr_api.dll','VMProtectSDK32.dll')) {
+            $hit = Get-ChildItem $env:GITHUB_WORKSPACE -Recurse -Filter $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { Copy-Item $hit.FullName C:\artifact -Force; Write-Host "staged $pattern from $($hit.FullName)" }
+          }
+
+      - name: Upload client
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roblox-2016-client
+          path: C:\artifact
+          if-no-files-found: warn
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            C:\bld\build.log
+            C:\bld\build.binlog
+            C:\vcbt_log.txt
+          if-no-files-found: warn
+          retention-days: 7
