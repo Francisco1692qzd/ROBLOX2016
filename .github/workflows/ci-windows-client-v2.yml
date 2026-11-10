@@ -1,0 +1,232 @@
+name: Build client v140 (fixed)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ci-windows-client-v2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    steps:
+      - name: Enable long paths before checkout
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' 
+            -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force | Out-Null
+          Write-Host "long paths enabled"
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Repair missing Boost 1.74 sources and headers
+        shell: pwsh
+        run: |
+          Continue = 'Stop'
+           = Join-Path  'Library\boost\libs\thread\src\win32'
+           = Join-Path  'Library\boost\include\boost\thread\win32'
+           = Join-Path  'Library\boost\include\boost\preprocessor\debug'
+          New-Item -ItemType Directory -Force -Path  | Out-Null
+          New-Item -ItemType Directory -Force -Path  | Out-Null
+          New-Item -ItemType Directory -Force -Path  | Out-Null
+
+           = @(
+            @{ Url = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32/thread.cpp';                     Dest = Join-Path  'thread.cpp' },
+            @{ Url = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32/tss_dll.cpp';                    Dest = Join-Path  'tss_dll.cpp' },
+            @{ Url = 'https://raw.githubusercontent.com/boostorg/thread/boost-1.74.0/src/win32/tss_pe.cpp';                     Dest = Join-Path  'tss_pe.cpp' },
+            @{ Url = 'https://raw.githubusercontent.com/boostorg/preprocessor/boost-1.74.0/include/boost/preprocessor/debug/thread_primitives.hpp'; Dest = Join-Path  'thread_primitives.hpp' },
+            @{ Url = 'https://raw.githubusercontent.com/boostorg/preprocessor/boost-1.74.0/include/boost/preprocessor/debug/error.hpp';       Dest = Join-Path  'error.hpp' }
+          )
+          foreach ( in ) {
+            curl.exe -sSL --retry 3 --retry-delay 5 -o .Dest .Url
+            if (-not (Test-Path .Dest)) { throw "download failed: " }
+             = (Get-Item .Dest).Length
+            if ( -lt 500) { throw "download too small ( bytes): " }
+            Write-Host ("ok {0,7} bytes  {1}" -f , .Dest)
+          }
+
+      - name: Create FastLog.h stub (ROBLOX internal header)
+        shell: pwsh
+        run: |
+           = Join-Path  'Base\include\rbx\FastLog.h'
+           = Split-Path  -Parent
+          New-Item -ItemType Directory -Force -Path  | Out-Null
+          @'
+#pragma once
+
+#include <cstdio>
+#include <string>
+
+namespace FastLog {
+
+template<typename... Args>
+void Log(const char* format, Args... args) {
+  std::printf(format, args...);
+}
+
+template<typename... Args>
+void Error(const char* format, Args... args) {
+  std::fprintf(stderr, format, args...);
+}
+
+} // namespace FastLog
+'@ | Set-Content -Path  -Encoding utf8
+          Write-Host "Created FastLog.h stub at "
+
+      - name: Try installing VS2015 build tools (v140)
+        id: vs2015
+        shell: pwsh
+        timeout-minutes: 60
+        run: |
+           = 'C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\bin\cl.exe'
+          if (Test-Path ) { Write-Host 'v140 already present'; "GOT_V140=1" | Out-File -Append ; exit 0 }
+          try {
+             = 'https://download.microsoft.com/download/5/f/7/5f7acaeb-8363-451f-9425-68a90f98b238/visualcppbuildtools_full.exe'
+            curl.exe -sSL --retry 3 -o C:\vcbt2015.exe 
+            if (-not (Test-Path C:\vcbt2015.exe) -or (Get-Item C:\vcbt2015.exe).Length -lt 1000000) { throw 'installer download failed' }
+            Write-Host 'running silent install (this can take 30-45 min)...'
+            Start-Process -FilePath C:\vcbt2015.exe -ArgumentList '/Q','/Full','/NoRestart','/L','C:\vcbt_log.txt' -Wait -WindowStyle Hidden
+          } catch {
+            Write-Host "installer problem: "
+          }
+          if (Test-Path ) {
+            Write-Host 'SUCCESS: v140 toolchain available'
+            "GOT_V140=1" | Out-File -Append 
+          } else {
+            Write-Host 'v140 not available - will retarget the projects'
+            "GOT_V140=0" | Out-File -Append 
+            if (Test-Path C:\vcbt_log.txt) { Get-Content C:\vcbt_log.txt -Tail 40 }
+          }
+
+      - name: Pick and apply toolset
+        shell: pwsh
+        run: |
+          if ( -eq '1') {
+            Write-Host 'Using the projects as-is (v140_xp).'
+            "MSBUILD_EXE=C:\Program Files (x86)\MSBuild\14.0\Bin\MSBuild.exe" | Out-File -Append 
+            exit 0
+          }
+           = (Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter MSBuild.exe -ErrorAction SilentlyContinue |
+                      Where-Object { .FullName -match '\\Bin\\MSBuild\.exe$' } | Select-Object -First 1).FullName
+          if (-not ) { throw 'no MSBuild found' }
+           = 'v143'
+          Write-Host "Falling back to  using "
+          "MSBUILD_EXE=" | Out-File -Append 
+           = 0
+          Get-ChildItem  -Recurse -Include *.vcxproj,*.props,*.targets |
+            Where-Object { .FullName -notmatch '\\Library\\' } | ForEach-Object {
+               = Get-Content .FullName -Raw
+                =  -replace '<PlatformToolset>v140_xp</PlatformToolset>', "<PlatformToolset></PlatformToolset>" 
+                           -replace '<PlatformToolset>v140</PlatformToolset>',    "<PlatformToolset></PlatformToolset>"
+              if ( -ne ) { Set-Content -Path .FullName -Value  -NoNewline -Encoding UTF8; ++ }
+            }
+          Write-Host "retargeted  project file(s) to "
+
+      - name: Build WindowsClient (Release|Win32)
+        shell: pwsh
+        run: |
+           = 
+               = Join-Path  'Roblox.sln'
+          Write-Host "MSBuild : "
+          Write-Host "Solution: "
+          New-Item -ItemType Directory -Force -Path C:\bld | Out-Null
+          &   /t:WindowsClient /p:Configuration=Release /p:Platform=Win32 
+              /p:MultiProcessorCompilation=true /m /v:m /nologo 
+              /bl:C:\bld\build.binlog 2>&1 | Tee-Object -FilePath C:\bld\build.log
+           = 
+          Write-Host "MSBuild exit code: "
+          exit 
+
+      - name: Stage exe and runtime DLLs
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\artifact | Out-Null
+           = Join-Path  'WindowsClient\Win32\Release'
+          if (Test-Path ) {
+            Copy-Item "\*.exe" C:\artifact -Force -ErrorAction SilentlyContinue
+            Get-ChildItem C:\artifact | Format-Table Name, Length
+          } else {
+            Write-Host "no output directory: "
+          }
+          foreach ( in @('fmod.dll','SDL2.dll','d3dcompiler_47.dll','openvr_api.dll','VMProtectSDK32.dll')) {
+             = Get-ChildItem  -Recurse -Filter  -ErrorAction SilentlyContinue | Select-Object -First 1
+            if () { Copy-Item .FullName C:\artifact -Force; Write-Host "staged  from " }
+          }
+
+      - name: Upload client
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roblox-2016-client
+          path: C:\artifact
+          if-no-files-found: warn
+
+      - name: Publish build diagnostics summary
+        if: always()
+        shell: pwsh
+        run: |
+           = 'C:\bld\build.log'
+          if (-not (Test-Path )) { Write-Host 'no build log'; exit 0 }
+           = Get-Content 
+          Write-Host "log lines: 0"
+           =  | Select-String -Pattern 'error\s+[A-Z]+[0-9]+|error MSB[0-9]+|fatal error' | Select-Object -First 60
+            =  | Select-String -Pattern 'warning\s+[A-Z]+[0-9]+' | Select-Object -First 10
+             =  | Select-Object -First 40
+             =  | Select-Object -Last 60
+           = New-Object System.Text.StringBuilder
+          [void].AppendLine('### Build diagnostics')
+          [void].AppendLine('')
+          [void].AppendLine("Total log lines: 0")
+          [void].AppendLine("Error lines found: 0")
+          [void].AppendLine('')
+          [void].AppendLine('#### Errors')
+          [void].AppendLine('`')
+          if () { foreach ( in ) { [void].AppendLine(.Line.Trim()) } } else { [void].AppendLine('(no error lines matched)') }
+          [void].AppendLine('`')
+          [void].AppendLine('#### First 40 lines')
+          [void].AppendLine('`')
+          foreach ( in ) { [void].AppendLine() }
+          [void].AppendLine('`')
+          [void].AppendLine('#### Last 60 lines')
+          [void].AppendLine('`')
+          foreach ( in ) { [void].AppendLine() }
+          [void].AppendLine('`')
+          .ToString() | Out-File -FilePath  -Append -Encoding utf8
+          Write-Host 'summary written'
+           = 0
+          foreach ( in ) {
+            if ( -ge 10) { break }
+             = .Line.Trim() -replace '%','%25' -replace "",'' -replace "
+",' '
+            if (.Length -gt 400) {  = .Substring(0, 400) }
+            Write-Host "::error title=MSBuild failure::"
+            ++
+          }
+          if ( -eq 0) {
+             = ( -join ' | ')
+            if (.Length -gt 400) {  = .Substring(.Length - 400) }
+            Write-Host "::error title=MSBuild failure (no error lines)::"
+          }
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            C:\bld\build.log
+            C:\bld\build.binlog
+            C:\vcbt_log.txt
+          if-no-files-found: warn
+          retention-days: 7
